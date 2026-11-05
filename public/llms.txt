@@ -1,0 +1,5 @@
+# Project Leaderboard
+> Performance-optimized tracking application.
+
+## Details
+- Type: Web Application

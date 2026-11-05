@@ -1,0 +1,8 @@
+{
+  "name": "Believe your belief Marathon - أسرة الأنبا إبرام",
+  "description": "A comprehensive app for 'Believe your belief' Course Marathon by Anba Abram University Family (A.A.F) with a points leaderboard, attendance tracking, and task verification with AI-powered feedback.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

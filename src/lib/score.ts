@@ -85,9 +85,8 @@ export function calculateParticipantScore(
   const taskPoints = userTasks.reduce((sum, t) => sum + t.points, 0);
   const approvedTasksCount = userTasks.length;
 
-  // Aggregate completed quizzes: use server-aggregated quiz totals when available, fallback to submissions
   const completedSubmissions = quizSubmissions.filter((s) => {
-    if (s.userId !== user.id || s.status !== "completed") return false;
+    if (s.userId !== user.id || (s.status !== "completed" && s.status !== "graded")) return false;
     if (resetAt > 0) {
       const time = s.submittedAt ? new Date(s.submittedAt).getTime() : 0;
       return time > resetAt;
@@ -152,6 +151,7 @@ export function calculateParticipantScore(
     praiseCount,
     approvedTasksCount,
     quizCount,
+    photoURL: user.photoURL || user.avatarBase64,
     hasAvatar: user.hasAvatar,
     avatarVersion: user.avatarVersion,
     hidePhotoOnBoard: user.hidePhotoOnBoard ?? user.hideNameOnBoard,

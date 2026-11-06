@@ -5,6 +5,7 @@ import { ApiService } from "../services/api";
 import { AuthenticatedImage } from "./AuthenticatedImage";
 import { BulkQuizImportModal } from "./BulkQuizImportModal";
 import { calculateParticipantScore } from "../lib/score";
+import { AdminDashboard } from "./AdminDashboard";
 import { 
   Users, 
   CalendarDays, 
@@ -43,6 +44,30 @@ interface AdminBoardProps {
   onUpdateState: (newState: DatabaseState) => void;
   setError: (msg: string) => void;
   setSuccess: (msg: string) => void;
+}
+
+function isRawJsonError(text?: string): boolean {
+  if (!text || typeof text !== "string") return false;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && (parsed.error || parsed.code || parsed.statusCode || parsed.message)) {
+        return true;
+      }
+    } catch {
+      if (trimmed.includes('"error"') || trimmed.includes('"code"') || trimmed.includes('503')) {
+        return true;
+      }
+    }
+  }
+  return (
+    trimmed.includes('{"error"') ||
+    trimmed.includes('"code":503') ||
+    trimmed.includes('503 UNAVAILABLE') ||
+    trimmed.includes('RESOURCE_EXHAUSTED') ||
+    (trimmed.includes('UNAVAILABLE') && trimmed.includes('{'))
+  );
 }
 
 export default function AdminBoard({ state, onUpdateState, setError, setSuccess }: AdminBoardProps) {
@@ -158,6 +183,79 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
     }
   };
 
+  // Resilient Submission Data Fetching with Silent Auto-Retry for Cold Starts
+  const [isFetchingSubmissions, setIsFetchingSubmissions] = useState(false);
+  const retryCountRef = React.useRef(0);
+  const retryTimerRef = React.useRef<NodeJS.Timeout | null>(null);
+
+  const fetchSubmissionsData = React.useCallback(async (isManual = false) => {
+    setIsFetchingSubmissions(true);
+    try {
+      const res = await ApiService.getAdminSubmissions();
+      const freshSubmissions = res.submissions || res.quizSubmissions || [];
+
+      if (freshSubmissions.length > 0) {
+        onUpdateState({
+          ...state,
+          quizSubmissions: freshSubmissions,
+        });
+        setIsFetchingSubmissions(false);
+        retryCountRef.current = 0;
+        if (isManual) {
+          setSuccess("تم تحديث وجلب تسليمات الكويزات بنجاح! 🔄");
+        }
+        return;
+      }
+
+      // If initial response returns empty while loading, implement automatic silent retry (up to 3 retries spaced 2 seconds apart)
+      if (retryCountRef.current < 3) {
+        retryCountRef.current += 1;
+        if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = setTimeout(() => {
+          fetchSubmissionsData(isManual);
+        }, 2000);
+      } else {
+        setIsFetchingSubmissions(false);
+        retryCountRef.current = 0;
+        if (isManual) {
+          setSuccess("تم فحص وتحديث التسليمات (لا توجد تسليمات جديدة حالياً). 🔄");
+        }
+      }
+    } catch (err: unknown) {
+      if (retryCountRef.current < 3) {
+        retryCountRef.current += 1;
+        if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = setTimeout(() => {
+          fetchSubmissionsData(isManual);
+        }, 2000);
+      } else {
+        setIsFetchingSubmissions(false);
+        retryCountRef.current = 0;
+        if (isManual) {
+          const msg = err instanceof Error ? err.message : "تعذر تحديث البيانات، حاول مرة أخرى";
+          setError(msg);
+        }
+      }
+    }
+  }, [state, onUpdateState, setError, setSuccess]);
+
+  const handleRefreshSubmissions = () => {
+    retryCountRef.current = 0;
+    if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    fetchSubmissionsData(true);
+  };
+
+  React.useEffect(() => {
+    if (!state?.quizSubmissions || state.quizSubmissions.length === 0) {
+      fetchSubmissionsData(false);
+    }
+    return () => {
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+      }
+    };
+  }, []);
+
   // Database lists - memoized to prevent redundant filtering
   const participants = React.useMemo(() => {
     return (state?.users || []).filter(u => u && u.role !== "admin");
@@ -178,9 +276,12 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
             const result = sub.questionResults?.[q.id] || {};
             const autoItem = sub.essayGrades?.[q.id];
             const autoScore = autoItem ? autoItem.score : (result.pointsEarned ?? 0);
-            const autoFeedback = autoItem
+            const rawFeedback = autoItem
               ? autoItem.gradingReasoning
               : (result.feedback && result.feedback !== "بانتظار تصحيح الخادم..." ? result.feedback : "");
+            const autoFeedback = isRawJsonError(rawFeedback)
+              ? "تنبيه: الخدمة آلياً تحت الضغط المؤقت - بانتظار الاعتماد اليدوي من المشرف"
+              : rawFeedback;
             initialGrades[q.id] = {
               pointsEarned: autoScore,
               feedback: autoFeedback
@@ -380,76 +481,18 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
     }
   };
 
-  // 2.5 Save Essay Grades Handler
+  // 2.5 Save Essay Grades Handler (Manual Admin Review)
   const handleSaveEssayGrades = async () => {
     if (!selectedSubmissionDetails) return;
     
     setIsSubmittingGrades(true);
     try {
-      const data = await ApiService.gradeEssay(selectedSubmissionDetails.sub.id, essayGrades);
+      const data = await ApiService.gradeEssayManual(selectedSubmissionDetails.sub.id, essayGrades);
       onUpdateState(data.db);
-      setSuccess("تم تصحيح وتصديق درجات الجزء المقالي بنجاح! 🎉");
+      setSuccess("تم حفظ التصحيح اليدوي ورصد درجات الأسئلة المقالية بنجاح! 🎉");
       setSelectedSubmissionDetails(null);
     } catch (err: any) {
-      setError(err.message || "حدث خطأ ما");
-    } finally {
-      setIsSubmittingGrades(false);
-    }
-  };
-
-  // Auto-grade all pending essay submissions across all quizzes
-  const handleBatchAutoGrade = async () => {
-    setIsBatchAutoGrading(true);
-    try {
-      const data = await ApiService.autoGradeEssays();
-      onUpdateState(data.db);
-      setSuccess(data.message || "تم تصحيح الإجابات المقالية المعلقة بنجاح بالذكاء الاصطناعي!");
-    } catch (err: any) {
-      setError(err.message || "فشل التصحيح التلقائي بالذكاء الاصطناعي");
-    } finally {
-      setIsBatchAutoGrading(false);
-    }
-  };
-
-  // Auto-grade a specific submission or question on demand
-  const handleAutoGradeSubmissionQuestion = async (submissionId: string, questionId?: string) => {
-    setIsAutoGradingSingle(questionId || submissionId);
-    try {
-      const data = await ApiService.autoGradeEssays({ submissionId, questionId });
-      onUpdateState(data.db);
-      if (selectedSubmissionDetails && data.submission) {
-        setSelectedSubmissionDetails((prev: any) => ({
-          ...prev,
-          sub: data.submission
-        }));
-      }
-      setSuccess("تم بنجاح التقييم الذكي الصارم وحساب الدرجات المستحقة! 🎯");
-    } catch (err: any) {
-      setError(err.message || "فشل التقييم الذكي");
-    } finally {
-      setIsAutoGradingSingle(null);
-    }
-  };
-
-  // 1-Click Approve proposed auto-grade
-  const handle1ClickApproveEssay = async (questionId: string, score: number, reasoning: string) => {
-    if (!selectedSubmissionDetails) return;
-    const currentGrades = {
-      ...essayGrades,
-      [questionId]: {
-        pointsEarned: score,
-        feedback: reasoning
-      }
-    };
-    setEssayGrades(currentGrades);
-    setIsSubmittingGrades(true);
-    try {
-      const data = await ApiService.gradeEssay(selectedSubmissionDetails.sub.id, currentGrades);
-      onUpdateState(data.db);
-      setSuccess(`تم اعتماد التقييم الذكي ورصد ${score} نقطة بنجاح! 🎉`);
-      setSelectedSubmissionDetails(null);
-    } catch (err: any) {
-      setError(err.message || "حدث خطأ ما أثناء اعتماد الدرجة");
+      setError(err.message || "حدث خطأ أثناء حفظ التصحيح اليدوي");
     } finally {
       setIsSubmittingGrades(false);
     }
@@ -1102,6 +1145,24 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   return (
     <div className="space-y-6">
 
+      {/* Admin Board Header with Manual Refresh Submissions Action */}
+      <div className="flex items-center justify-between flex-wrap gap-3 pb-3 border-b border-natural-border">
+        <div className="flex items-center gap-2">
+          <span className="text-xl">🛡️</span>
+          <h2 className="text-sm sm:text-base font-black text-natural-text">لوحة تحكم وإدارة المسابقة</h2>
+        </div>
+        <button
+          type="button"
+          onClick={handleRefreshSubmissions}
+          disabled={isFetchingSubmissions}
+          className="flex items-center gap-2 px-3.5 py-1.5 text-xs font-bold text-natural-green bg-natural-green/10 hover:bg-natural-green/20 border border-natural-green/30 rounded-xl transition-all cursor-pointer shadow-2xs active:scale-95 disabled:opacity-50"
+          title="تحديث وإعادة جلب تسليمات الكويزات بدون إعادة تحميل الصفحة"
+        >
+          <span className={isFetchingSubmissions ? "animate-spin" : ""}>🔄</span>
+          <span>تحديث البيانات 🔄</span>
+        </button>
+      </div>
+
       {/* Tabs */}
       <div className="flex border-b border-natural-border gap-1 overflow-x-auto pb-px">
         <button
@@ -1113,6 +1174,16 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
           }`}
         >
           📅 رصد الغياب والحضور
+        </button>
+        <button
+          onClick={() => setActiveTab("admin_dashboard")}
+          className={`px-4 py-2 text-sm font-bold border-b-2 transition-all whitespace-nowrap cursor-pointer ${
+            activeTab === "admin_dashboard"
+              ? "border-natural-green text-natural-green font-extrabold"
+              : "border-transparent text-natural-muted hover:text-natural-text"
+          }`}
+        >
+          📊 لوحة التصحيح والتسليمات
         </button>
         <button
           onClick={() => setActiveTab("quizzes")}
@@ -1260,6 +1331,16 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
           </button>
         </div>
       </div>
+
+      {/* Tab 0: Admin Dashboard */}
+      {activeTab === "admin_dashboard" && (
+        <AdminDashboard
+          state={state}
+          onUpdateState={onUpdateState}
+          onRefreshData={handleRefreshSubmissions}
+          isLoading={isFetchingSubmissions}
+        />
+      )}
 
       {/* Tab 1: Attendance Roster */}
       {activeTab === "attendance" && (
@@ -2254,22 +2335,33 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
               <div className="space-y-3">
                 <div className="flex items-center justify-between flex-wrap gap-2">
                   <h4 className="font-bold text-natural-green text-xs">🏆 حلول وتسليمات المشتركين للكويزات ({state?.quizSubmissions?.length || 0})</h4>
-                  {(state?.quizSubmissions || []).some(s => s.status === "grading") && (
-                    <button
-                      type="button"
-                      onClick={handleBatchAutoGrade}
-                      disabled={isBatchAutoGrading}
-                      className="bg-natural-accent hover:bg-orange-600 disabled:opacity-50 text-white font-extrabold text-[10px] py-1 px-2.5 rounded-lg flex items-center gap-1 cursor-pointer transition-all shadow-xs"
-                      title="تصحيح جميع الإجابات المقالية المعلقة دفعة واحدة بالذكاء الاصطناعي وفق المعايير الصارمة"
-                    >
-                      <Sparkles className="w-3 h-3" />
-                      {isBatchAutoGrading ? "جاري التصحيح الذكي..." : "تصحيح كل المقالي بالذكاء الاصطناعي 🤖"}
-                    </button>
+                  {isFetchingSubmissions && (
+                    <span className="flex items-center gap-1.5 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full animate-pulse">
+                      <Loader2 className="w-3 h-3 animate-spin text-amber-600" />
+                      جاري التحقق من التسليمات تلقائياً...
+                    </span>
                   )}
                 </div>
                 
                 <div className="space-y-2.5 max-h-[280px] overflow-y-auto pr-1">
-                  {!state?.quizSubmissions || state?.quizSubmissions?.length === 0 ? (
+                  {isFetchingSubmissions && (!state?.quizSubmissions || state?.quizSubmissions?.length === 0) ? (
+                    /* Clean Skeletal Loading Indicator */
+                    <div className="space-y-2.5 animate-pulse">
+                      {[1, 2, 3].map((skeletonIdx) => (
+                        <div
+                          key={skeletonIdx}
+                          className="p-3 bg-white border border-slate-200 rounded-xl flex items-center justify-between gap-3 shadow-2xs"
+                        >
+                          <div className="space-y-2 flex-1">
+                            <div className="h-3.5 bg-slate-200 rounded w-1/3" />
+                            <div className="h-2.5 bg-slate-150 rounded w-1/2" />
+                            <div className="h-2 bg-slate-100 rounded w-1/4" />
+                          </div>
+                          <div className="w-16 h-6 bg-slate-100 rounded-full shrink-0" />
+                        </div>
+                      ))}
+                    </div>
+                  ) : !state?.quizSubmissions || state?.quizSubmissions?.length === 0 ? (
                     <div className="p-4 rounded-xl border border-dashed border-natural-border text-center text-xs text-natural-muted">
                       لا يوجد حلول مسلمة من المشاركين حتى الآن.
                     </div>
@@ -2310,9 +2402,9 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                               <span className="text-xs font-black border px-2.5 py-1 rounded-full text-rose-700 bg-rose-50 border-rose-200">
                                 ملغي (0)
                               </span>
-                            ) : sub.status === "grading" ? (
+                            ) : sub.status === "pending_manual_review" || sub.status === "grading" ? (
                               <span className="text-xs font-black border px-2.5 py-1 rounded-full text-amber-700 bg-amber-50 border-amber-200 animate-pulse">
-                                معلق (بانتظار التصحيح ⏳)
+                                بانتظار التصحيح اليدوي ⏳
                               </span>
                             ) : (
                               <span className="text-xs font-black border px-2.5 py-1 rounded-full text-natural-green bg-natural-cream border-natural-border/60">
@@ -3152,6 +3244,8 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             <td className="py-2.5 px-4 font-bold text-natural-text whitespace-nowrap">
                               <div className="flex items-center gap-2.5">
                                 <Avatar
+                                  src={user.photoURL}
+                                  name={user.name}
                                   userId={user.id}
                                   userName={user.name}
                                   size={96}
@@ -3386,209 +3480,73 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             </p>
                           )}
                           {q.type === "essay" && (
-                            <div className="space-y-1">
-                              <p className="text-[10px] text-natural-muted">
-                                💡 نموذج الإجابة المطلوب: {q.correctAnswer}
-                              </p>
-                              {Array.isArray(q.rubricPoints) && q.rubricPoints.length > 0 && (
-                                <div className="text-[10px] text-natural-muted/90 bg-slate-50 dark:bg-slate-800/40 p-2 rounded-lg border border-slate-200/60 dark:border-slate-700/60">
-                                  <span className="font-bold text-natural-green block mb-0.5">📋 عناصر التقييم المعتمدة ({q.rubricPoints.length} معايير):</span>
-                                  <ul className="list-disc list-inside space-y-0.5 pr-1 font-medium">
-                                    {q.rubricPoints.map((rb: string, rbI: number) => (
-                                      <li key={rbI}>{rb}</li>
-                                    ))}
-                                  </ul>
+                            <div className="space-y-3 pt-1">
+                              {/* Stored Model Answer as Admin Reference */}
+                              <div className="p-3 bg-amber-50/80 dark:bg-amber-950/40 rounded-xl border border-amber-200 dark:border-amber-800/60 text-right space-y-1">
+                                <span className="text-[11px] font-black text-amber-900 dark:text-amber-300 block">
+                                  💡 نموذج الإجابة الإسترشادي للمشرف:
+                                </span>
+                                <p className="text-xs font-bold text-amber-950 dark:text-amber-100 leading-relaxed">
+                                  {q.modelAnswer || q.correctAnswer || "لا يوجد نموذج محدد لهذا السؤال."}
+                                </p>
+                              </div>
+
+                              {!isStarted && (
+                                <div className="bg-white dark:bg-slate-900 p-3.5 rounded-xl border border-natural-border/80 space-y-3 text-right">
+                                  <p className="text-xs font-extrabold text-natural-green flex items-center gap-1">
+                                    📝 التصحيح اليدوي للسؤال المقالي (من {q.points} نقطة):
+                                  </p>
+                                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                    <div className="sm:col-span-1">
+                                      <label className="block text-[10px] font-bold text-natural-green mb-1 text-right">الدرجة المستحقة:</label>
+                                      <input
+                                        type="number"
+                                        min={0}
+                                        max={q.points}
+                                        step={0.25}
+                                        required
+                                        value={essayGrades[q.id]?.pointsEarned ?? (result.pointsEarned || 0)}
+                                        onChange={(e) => {
+                                          const val = parseFloat(e.target.value) || 0;
+                                          setEssayGrades({
+                                            ...essayGrades,
+                                            [q.id]: {
+                                              ...essayGrades[q.id],
+                                              pointsEarned: Math.max(0, Math.min(q.points, val)),
+                                              feedback: essayGrades[q.id]?.feedback ?? (result.feedback || "")
+                                            }
+                                          });
+                                        }}
+                                        className="w-full text-xs p-2 rounded-lg border border-natural-border bg-natural-cream dark:bg-slate-800 outline-hidden focus:border-natural-green font-bold text-center text-natural-text dark:text-slate-100"
+                                      />
+                                    </div>
+                                    <div className="sm:col-span-2">
+                                      <label className="block text-[10px] font-bold text-natural-green mb-1 text-right">تعليق وملاحظات المشرف:</label>
+                                      <input
+                                        type="text"
+                                        placeholder="أحسنت، إجابة ممتازة وواضحة..."
+                                        value={essayGrades[q.id]?.feedback ?? (result.feedback && result.feedback !== "بانتظار تصحيح المشرف..." ? result.feedback : "")}
+                                        onChange={(e) => {
+                                          setEssayGrades({
+                                            ...essayGrades,
+                                            [q.id]: {
+                                              pointsEarned: essayGrades[q.id]?.pointsEarned ?? (result.pointsEarned || 0),
+                                              feedback: e.target.value
+                                            }
+                                          });
+                                        }}
+                                        className="w-full text-xs p-2 rounded-lg border border-natural-border bg-natural-cream dark:bg-slate-800 outline-hidden focus:border-natural-green font-semibold text-natural-text dark:text-slate-100 text-right"
+                                      />
+                                    </div>
+                                  </div>
                                 </div>
                               )}
                             </div>
                           )}
 
-                          {!isStarted && q.type === "essay" && (
-                            (() => {
-                              const autoGradeItem = selectedSubmissionDetails.sub.essayGrades?.[q.id];
-                              const matchedPoints: string[] = autoGradeItem?.matchedRubricPoints || result.matchedRubricPoints || [];
-                              const missingPoints: string[] = autoGradeItem?.missingRubricPoints || result.missingRubricPoints || [];
-                              const hasRubricData = matchedPoints.length > 0 || missingPoints.length > 0 || Boolean(autoGradeItem);
-                              const proposedScore = autoGradeItem ? autoGradeItem.score : (result.autoGraded ? result.pointsEarned : 0);
-                              const reasoningText = autoGradeItem?.gradingReasoning || result.gradingReasoning || "";
-
-                              return (
-                                <div className="space-y-3 mt-3">
-                                  {hasRubricData ? (
-                                    <div className="p-3.5 bg-slate-50 dark:bg-slate-800/70 rounded-2xl border border-slate-200 dark:border-slate-700 space-y-3 text-right">
-                                      <div className="flex items-center justify-between flex-wrap gap-2 pb-2 border-b border-slate-200 dark:border-slate-700">
-                                        <div className="flex items-center gap-1.5 text-xs font-black text-slate-800 dark:text-slate-100">
-                                          <Sparkles className="w-4 h-4 text-amber-500 fill-amber-500" />
-                                          <span>التقييم الذكي الصارم بالمعايير (Gemini Rubric Auto-Grading)</span>
-                                          {autoGradeItem?.status === "auto_graded" && (
-                                            <span className="text-[9px] font-extrabold px-1.5 py-0.2 bg-amber-100 text-amber-800 rounded border border-amber-300">
-                                              بانتظار الاعتماد
-                                            </span>
-                                          )}
-                                          {autoGradeItem?.status === "admin_approved" && (
-                                            <span className="text-[9px] font-extrabold px-1.5 py-0.2 bg-emerald-100 text-emerald-800 rounded border border-emerald-300">
-                                              معتمد ✓
-                                            </span>
-                                          )}
-                                          {autoGradeItem?.status === "admin_overridden" && (
-                                            <span className="text-[9px] font-extrabold px-1.5 py-0.2 bg-blue-100 text-blue-800 rounded border border-blue-300">
-                                              معدل يدوياً ✏️
-                                            </span>
-                                          )}
-                                        </div>
-                                        <div className="flex items-center gap-2">
-                                          <span className="text-xs font-black px-2.5 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-200 border border-emerald-300">
-                                            الدرجة المحتسبة: {proposedScore} / {q.points} نقطة
-                                          </span>
-                                          <button
-                                            type="button"
-                                            disabled={isAutoGradingSingle === q.id}
-                                            onClick={() => handleAutoGradeSubmissionQuestion(selectedSubmissionDetails.sub.id, q.id)}
-                                            className="text-[10px] text-natural-accent hover:underline font-bold cursor-pointer disabled:opacity-50 flex items-center gap-1"
-                                          >
-                                            <RotateCcw className="w-3 h-3" />
-                                            {isAutoGradingSingle === q.id ? "جاري التقييم..." : "إعادة التقييم الذكي"}
-                                          </button>
-                                        </div>
-                                      </div>
-
-                                      {/* Matched Rubric Points - Green */}
-                                      {matchedPoints.length > 0 && (
-                                        <div className="space-y-1.5">
-                                          <div className="flex items-center gap-1 text-[11px] font-extrabold text-emerald-700 dark:text-emerald-300">
-                                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                                            <span>المعايير المستوفاة بدقة ({matchedPoints.length}):</span>
-                                          </div>
-                                          <div className="space-y-1 pr-2">
-                                            {matchedPoints.map((item: string, mIdx: number) => (
-                                              <div key={mIdx} className="p-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-[11px] font-bold text-emerald-900 dark:text-emerald-200 flex items-start gap-1.5">
-                                                <span className="text-emerald-600 font-black">✓</span>
-                                                <span className="leading-relaxed">{item}</span>
-                                              </div>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      )}
-
-                                      {/* Missing Rubric Points - Red */}
-                                      {missingPoints.length > 0 && (
-                                        <div className="space-y-1.5">
-                                          <div className="flex items-center gap-1 text-[11px] font-extrabold text-rose-700 dark:text-rose-300">
-                                            <XCircle className="w-3.5 h-3.5 text-rose-600" />
-                                            <span>المعايير الناقصة / غير المذكورة ({missingPoints.length}):</span>
-                                          </div>
-                                          <div className="space-y-1 pr-2">
-                                            {missingPoints.map((item: string, missIdx: number) => (
-                                              <div key={missIdx} className="p-2 rounded-lg bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-[11px] font-bold text-rose-900 dark:text-rose-200 flex items-start gap-1.5">
-                                                <span className="text-rose-600 font-black">✗</span>
-                                                <span className="leading-relaxed">{item}</span>
-                                              </div>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      )}
-
-                                      {/* Grading Reasoning */}
-                                      {reasoningText && (
-                                        <div className="p-2.5 rounded-lg bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 text-[11px] text-amber-900 dark:text-amber-200 space-y-1">
-                                          <span className="font-extrabold block text-amber-800 dark:text-amber-300">💡 التحليل والتعليل الأكاديمي:</span>
-                                          <p className="pr-1 leading-relaxed font-semibold">{reasoningText}</p>
-                                        </div>
-                                      )}
-
-                                      {/* 1-Click Approval Action Bar */}
-                                      {selectedSubmissionDetails.sub.status === "grading" && (
-                                        <div className="pt-2 flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 dark:border-slate-700">
-                                          <span className="text-[10px] text-natural-muted font-bold">يمكنك اعتماد التقييم فوراً أو تعديله يدوياً أدناه:</span>
-                                          <button
-                                            type="button"
-                                            disabled={isSubmittingGrades}
-                                            onClick={() => handle1ClickApproveEssay(
-                                              q.id,
-                                              proposedScore,
-                                              reasoningText || "تم اعتماد التقييم الذكي الصارم بنجاح."
-                                            )}
-                                            className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-black text-xs py-1.5 px-3 rounded-lg flex items-center gap-1.5 cursor-pointer shadow-xs transition-all"
-                                          >
-                                            <CheckCircle2 className="w-3.5 h-3.5" />
-                                            اعتماد التقييم المقترح فوراً ({proposedScore} نقطة) ⚡
-                                          </button>
-                                        </div>
-                                      )}
-                                    </div>
-                                  ) : (
-                                    <div className="p-3 bg-amber-50/70 rounded-xl border border-amber-200 flex items-center justify-between gap-2">
-                                      <span className="text-xs font-bold text-amber-900">هذا السؤال لم يتم تقييمه بالذكاء الاصطناعي بعد:</span>
-                                      <button
-                                        type="button"
-                                        disabled={isAutoGradingSingle === q.id}
-                                        onClick={() => handleAutoGradeSubmissionQuestion(selectedSubmissionDetails.sub.id, q.id)}
-                                        className="bg-natural-accent hover:bg-orange-600 disabled:opacity-50 text-white font-black text-[10px] py-1.5 px-3 rounded-lg flex items-center gap-1 cursor-pointer transition-colors shadow-xs"
-                                      >
-                                        <Sparkles className="w-3 h-3" />
-                                        {isAutoGradingSingle === q.id ? "جاري التقييم بالذكاء الاصطناعي..." : "تقييم بالذكاء الاصطناعي (Strict Rubric) 🤖"}
-                                      </button>
-                                    </div>
-                                  )}
-
-                                  {/* Manual Edit or Override Form */}
-                                  {selectedSubmissionDetails.sub.status === "grading" && (
-                                    <div className="bg-white p-3 rounded-xl border border-natural-border/80 space-y-2.5 text-right">
-                                      <p className="text-[10px] font-bold text-natural-green flex items-center gap-1">
-                                        📝 تعديل / تأكيد درجة هذا السؤال المقالي وملاحظات المشارك:
-                                      </p>
-                                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                                        <div className="sm:col-span-1">
-                                          <label className="block text-[9px] font-bold text-natural-green mb-1 text-right">الدرجة المعتمدة (من {q.points}):</label>
-                                          <input
-                                            type="number"
-                                            min={0}
-                                            max={q.points}
-                                            step={0.25}
-                                            required
-                                            value={essayGrades[q.id]?.pointsEarned ?? 0}
-                                            onChange={(e) => {
-                                              const val = parseFloat(e.target.value) || 0;
-                                              setEssayGrades({
-                                                ...essayGrades,
-                                                [q.id]: {
-                                                  ...essayGrades[q.id],
-                                                  pointsEarned: Math.max(0, Math.min(q.points, val))
-                                                }
-                                              });
-                                            }}
-                                            className="w-full text-xs p-2 rounded-lg border border-natural-border bg-natural-cream outline-hidden focus:border-natural-green font-bold text-center text-natural-text"
-                                          />
-                                        </div>
-                                        <div className="sm:col-span-2">
-                                          <label className="block text-[9px] font-bold text-natural-green mb-1 text-right">الملاحظات والتعليق:</label>
-                                          <input
-                                            type="text"
-                                            placeholder="أحسنت يا بطل، إجابة وافية وممتازة..."
-                                            value={essayGrades[q.id]?.feedback ?? ""}
-                                            onChange={(e) => {
-                                              setEssayGrades({
-                                                ...essayGrades,
-                                                [q.id]: {
-                                                  ...essayGrades[q.id],
-                                                  feedback: e.target.value
-                                                }
-                                              });
-                                            }}
-                                            className="w-full text-xs p-2 rounded-lg border border-natural-border bg-natural-cream outline-hidden focus:border-natural-green font-semibold text-natural-text text-right"
-                                          />
-                                        </div>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })()
-                          )}
-
                           {!isStarted && q.type !== "essay" && result.feedback ? (
                             <div className="mt-2 bg-white/80 p-2 rounded-lg border border-natural-border/40 text-[11px] font-bold text-natural-green/95 text-right">
-                              📝 تقييم وملاحظات لجنة التقييم والمراجعة:
+                              📝 تقييم الإجابة:
                               <p className="font-medium text-natural-text/90 mt-1 pr-1.5 leading-relaxed font-bold">{result.feedback}</p>
                             </div>
                           ) : null}
@@ -3610,17 +3568,15 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                 🔓 {isReopeningQuiz ? "جاري إعادة فتح الاختبار..." : "إعادة فتح المحاولة وتصفير المخالفات"}
               </button>
 
-              {selectedSubmissionDetails.sub.status === "grading" && (
-                <button
-                  type="button"
-                  onClick={handleSaveEssayGrades}
-                  disabled={isSubmittingGrades}
-                  className="flex-1 bg-natural-accent hover:bg-orange-600 disabled:bg-natural-accent/50 text-white font-bold py-2.5 rounded-xl text-xs transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-sm"
-                >
-                  <Award className="w-4 h-4 fill-white text-white" />
-                  {isSubmittingGrades ? "جاري الحفظ..." : "اعتماد التصحيح ورصد الدرجة"}
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={handleSaveEssayGrades}
+                disabled={isSubmittingGrades}
+                className="flex-1 bg-natural-green hover:bg-natural-olive disabled:opacity-50 text-white font-bold py-2.5 rounded-xl text-xs transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-sm"
+              >
+                <Award className="w-4 h-4 fill-white text-white" />
+                {isSubmittingGrades ? "جاري الحفظ..." : "حفظ التصحيح اليدوي"}
+              </button>
 
               <button
                 type="button"

@@ -90,6 +90,76 @@ function initFirebase(): void {
   }
 }
 
+function getFirestore(): ReturnType<typeof getFirestoreAdmin> | null {
+  if (!firebaseInitialized) {
+    initFirebase();
+  }
+  if (firestoreDisabled) {
+    const now = Date.now();
+    if (now - lastFirestoreFailureTime < FIRESTORE_RETRY_COOLDOWN_MS) {
+      return null; // Bypassed during cooldown to keep app extremely responsive
+    } else {
+      console.log("Firestore recovery cooldown expired. Attempting to reconnect/retry synchronization with Cloud Firestore...");
+      firestoreDisabled = false;
+    }
+  }
+  return dbFirestore;
+}
+
+let firestoreInitPromise: Promise<ReturnType<typeof getFirestoreAdmin> | null> | null = null;
+
+async function ensureFirestoreInitialized(): Promise<ReturnType<typeof getFirestoreAdmin> | null> {
+  const current = getFirestore();
+  if (current) return current;
+
+  if (!firestoreInitPromise) {
+    firestoreInitPromise = (async () => {
+      try {
+        if (!firebaseInitialized) {
+          initFirebase();
+        }
+        if (firestoreDisabled) {
+          const now = Date.now();
+          if (now - lastFirestoreFailureTime >= FIRESTORE_RETRY_COOLDOWN_MS) {
+            firestoreDisabled = false;
+          }
+        }
+        return dbFirestore;
+      } finally {
+        firestoreInitPromise = null;
+      }
+    })();
+  }
+  return firestoreInitPromise;
+}
+
+async function withFirestoreRetry<T>(
+  operation: (db: ReturnType<typeof getFirestoreAdmin>) => Promise<T>,
+  maxRetries = 3,
+  delayMs = 400
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const db = await ensureFirestoreInitialized();
+      if (!db) {
+        throw new Error("قاعدة بيانات Firestore غير مهيأة أو في فترة التبريد");
+      }
+      return await operation(db);
+    } catch (err: unknown) {
+      lastError = err;
+      if (isFirestoreAuthError(err)) {
+        throw err;
+      }
+      if (attempt < maxRetries) {
+        console.warn(`[Firestore Retry] المحاولة ${attempt}/${maxRetries} أثناء بدء التشغيل البارد (Cold-Start):`, err instanceof Error ? err.message : err);
+        await new Promise((resolve) => setTimeout(resolve, delayMs * attempt));
+      }
+    }
+  }
+  throw lastError;
+}
+
 function getStorageBucket() {
   if (!firebaseInitialized) {
     initFirebase();
@@ -203,7 +273,7 @@ async function deleteFileFromStorage(filePath?: string): Promise<void> {
 
 const multerUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 3 * 1024 * 1024 }, // 3MB file size limit
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB file size limit
 });
 
 function validateImageMagicBytes(buffer: Buffer): string {
@@ -257,8 +327,8 @@ async function processAvatarWebP(inputBuffer: Buffer): Promise<{ buffer: Buffer;
 
   const buffer = await sharp(inputBuffer, { failOnError: false } as any)
     .rotate()
-    .resize(256, 256, { fit: "cover", position: "center" })
-    .webp({ quality: 80 })
+    .resize(300, 300, { fit: "cover", position: "center" })
+    .webp({ quality: 85 })
     .toBuffer();
 
   const base64 = `data:image/webp;base64,${buffer.toString("base64")}`;
@@ -281,15 +351,17 @@ async function saveAvatarToFirestore(userId: string, avatarBase64: string, avata
   // 1. In-memory cache update
   serverAvatarCache.set(userId, record);
 
-  // 2. Direct Firestore storage in dedicated 'avatars/{userId}' document
+  // 2. Persist EXCLUSIVELY to isolated Firestore collection 'avatars/{userId}'
+  // Propagate all errors to caller without silent swallowing to ensure API fails explicitly
+  await ensureFirestoreInitialized();
   const dbFs = getFirestore();
   if (dbFs) {
-    try {
-      await dbFs.collection("avatars").doc(userId).set(record);
-      console.log(`[Avatar] Saved Base64 WebP avatar for user ${userId} to Firestore.`);
-    } catch (fsErr) {
-      console.warn(`[Avatar] Failed to persist avatar to Firestore for user ${userId}:`, fsErr);
-    }
+    await withFirestoreRetry(async (fsInstance) => {
+      await fsInstance.collection("avatars").doc(userId).set(record, { merge: true });
+    }, 3, 350);
+    console.log(`[Avatar] Successfully persisted avatar to isolated Firestore collection avatars/${userId} (version: ${avatarVersion}).`);
+  } else if (process.env.NODE_ENV === "production") {
+    throw new Error("قاعدة بيانات Firestore غير متصلة؛ تعذر حفظ الصورة الشخصية.");
   }
 
   // 3. Keep local files as secondary cache
@@ -318,22 +390,19 @@ async function getAvatarFromFirestore(userId: string): Promise<AvatarRecord | nu
     return cached;
   }
 
-  // 2. Retrieve directly from Firestore dedicated 'avatars/{userId}'
-  const dbFs = getFirestore();
-  if (dbFs) {
-    try {
+  // 2. Retrieve directly from Firestore dedicated 'avatars/{userId}' with cold-start retry
+  try {
+    const record = await withFirestoreRetry<AvatarRecord | null>(async (dbFs) => {
       const docSnap = await dbFs.collection("avatars").doc(userId).get();
       if (docSnap.exists) {
         const data = docSnap.data() as Partial<AvatarRecord> | undefined;
         if (data && data.avatarBase64) {
-          const record: AvatarRecord = {
+          return {
             userId,
             avatarBase64: data.avatarBase64,
             avatarUpdatedAt: data.avatarUpdatedAt || new Date().toISOString(),
             avatarVersion: typeof data.avatarVersion === "number" ? data.avatarVersion : 1,
           };
-          serverAvatarCache.set(userId, record);
-          return record;
         }
       }
 
@@ -342,19 +411,23 @@ async function getAvatarFromFirestore(userId: string): Promise<AvatarRecord | nu
       if (userSnap.exists) {
         const userData = userSnap.data() as { avatarBase64?: string; avatarUpdatedAt?: string; avatarVersion?: number } | undefined;
         if (userData && userData.avatarBase64) {
-          const record: AvatarRecord = {
+          return {
             userId,
             avatarBase64: userData.avatarBase64,
             avatarUpdatedAt: userData.avatarUpdatedAt || new Date().toISOString(),
             avatarVersion: typeof userData.avatarVersion === "number" ? userData.avatarVersion : 1,
           };
-          serverAvatarCache.set(userId, record);
-          return record;
         }
       }
-    } catch (fsErr) {
-      console.warn(`[Avatar] Firestore avatar retrieval error for ${userId}:`, fsErr);
+      return null;
+    }, 3, 350);
+
+    if (record) {
+      serverAvatarCache.set(userId, record);
+      return record;
     }
+  } catch (fsErr) {
+    console.warn(`[Avatar] Firestore avatar retrieval error for ${userId}:`, fsErr);
   }
 
   // 3. Fallback: local disk cache / json file
@@ -425,14 +498,18 @@ async function removeAvatarFromFirestore(userId: string): Promise<void> {
   // 1. In-memory
   serverAvatarCache.delete(userId);
 
-  // 2. Firestore
+  // 2. Isolated Firestore collection
+  await ensureFirestoreInitialized();
   const dbFs = getFirestore();
   if (dbFs) {
     try {
-      await dbFs.collection("avatars").doc(userId).delete();
-      console.log(`[Avatar] Deleted avatar document from Firestore for user ${userId}.`);
+      await withFirestoreRetry(async (fsInstance) => {
+        await fsInstance.collection("avatars").doc(userId).delete();
+      }, 3, 350);
+      console.log(`[Avatar] Successfully deleted avatar document from isolated Firestore collection avatars/${userId}.`);
     } catch (fsErr) {
-      console.warn(`[Avatar] Failed to delete avatar document in Firestore for user ${userId}:`, fsErr);
+      console.error(`[Avatar] Error deleting avatar from Firestore for user ${userId}:`, fsErr);
+      throw fsErr;
     }
   }
 
@@ -475,21 +552,7 @@ async function getAvatarBuffer(userId: string, _size?: "512" | "96" | string): P
   return null;
 }
 
-function getFirestore(): ReturnType<typeof getFirestoreAdmin> | null {
-  if (!firebaseInitialized) {
-    initFirebase();
-  }
-  if (firestoreDisabled) {
-    const now = Date.now();
-    if (now - lastFirestoreFailureTime < FIRESTORE_RETRY_COOLDOWN_MS) {
-      return null; // Bypassed during cooldown to keep app extremely responsive
-    } else {
-      console.log("Firestore recovery cooldown expired. Attempting to reconnect/retry synchronization with Cloud Firestore...");
-      firestoreDisabled = false;
-    }
-  }
-  return dbFirestore;
-}
+
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -524,9 +587,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Increase payload limit for base64 image uploads
-app.use(express.json({ limit: "15mb" }));
-app.use(express.urlencoded({ limit: "15mb", extended: true }));
+// Increase Express body parser limits BEFORE registering any API routes
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 
 // Serve the uploaded logo directly to avoid bundler resolution issues
 app.get("/assets/logo.jpg", (req, res) => {
@@ -612,6 +675,7 @@ interface User {
   sessionVersion?: number;
   totalArchivedPoints?: number;
   pushSubscriptions?: WebPushSubscription[];
+  photoURL?: string;
   hasAvatar?: boolean;
   avatarVersion?: number;
   avatarUpdatedAt?: string | number;
@@ -638,6 +702,7 @@ interface QuizQuestion {
   questionText: string;
   options?: string[];
   correctAnswer?: string;
+  modelAnswer?: string;
   rubricPoints?: string[];
   points: number;
 }
@@ -663,10 +728,10 @@ interface Quiz {
 interface EssayGradeItem {
   questionId: string;
   score: number;
-  matchedRubricPoints: string[];
-  missingRubricPoints: string[];
+  matchedRubricPoints?: string[];
+  missingRubricPoints?: string[];
   gradingReasoning: string;
-  status: "auto_graded" | "admin_approved" | "admin_overridden";
+  status: "auto_graded" | "admin_approved" | "admin_overridden" | "pending_manual_review";
   gradedAt: string;
 }
 
@@ -679,6 +744,7 @@ interface QuizQuestionResult {
   missingRubricPoints?: string[];
   gradingReasoning?: string;
   autoGraded?: boolean;
+  status?: string;
 }
 
 interface QuizViolationRecord {
@@ -688,6 +754,8 @@ interface QuizViolationRecord {
   timestamp: string;
   leaveDuration: number;
   reason?: string;
+  type?: string;
+  details?: string;
 }
 
 interface QuizSubmission {
@@ -700,7 +768,7 @@ interface QuizSubmission {
   totalScore: number;
   submittedAt: string;
   gradedAt?: string;
-  status: "started" | "grading" | "completed" | "VIOLATION_TERMINATED";
+  status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "VIOLATION_TERMINATED";
   isManual?: boolean;
   violationCount?: number;
   violations?: QuizViolationRecord[];
@@ -895,6 +963,70 @@ function migrateDB(db: DatabaseSchema): boolean {
     }
   }
 
+  // Sanitize and decouple avatars from db.users: keep ONLY lightweight metadata
+  if (db.users && Array.isArray(db.users)) {
+    for (const u of db.users) {
+      // 1. Check if user currently has an avatar
+      const hadAvatar = Boolean(
+        u.hasAvatar ||
+        (u.avatarBase64 && u.avatarBase64.startsWith("data:image/")) ||
+        (u.photoURL && (u.photoURL.startsWith("data:image/") || u.photoURL.startsWith("/api/profile/avatar/")))
+      );
+
+      // 2. Strip heavy base64 strings and data URIs from db.users
+      if (u.avatarBase64) {
+        delete u.avatarBase64;
+        changed = true;
+      }
+      if (u.photoURL && u.photoURL.startsWith("data:image/")) {
+        delete u.photoURL;
+        changed = true;
+      }
+
+      // 3. Sanitize legacy invalid URLs (blob:, localhost, file://)
+      if (u.photoURL && (
+        u.photoURL.startsWith("blob:") ||
+        u.photoURL.startsWith("http://localhost") ||
+        u.photoURL.startsWith("https://localhost") ||
+        u.photoURL.startsWith("http://127.0.0.1") ||
+        u.photoURL.startsWith("file://")
+      )) {
+        u.photoURL = undefined;
+        changed = true;
+      }
+
+      // 4. Set lightweight metadata flags
+      if (hadAvatar) {
+        if (!u.hasAvatar) {
+          u.hasAvatar = true;
+          changed = true;
+        }
+        if (!u.avatarVersion || typeof u.avatarVersion !== "number") {
+          u.avatarVersion = 1;
+          changed = true;
+        }
+        if (!u.avatarUpdatedAt) {
+          u.avatarUpdatedAt = new Date().toISOString();
+          changed = true;
+        }
+        const relativeUrl = `/api/profile/avatar/${u.id}`;
+        if (u.photoURL !== relativeUrl) {
+          u.photoURL = relativeUrl;
+          changed = true;
+        }
+      } else {
+        if (u.hasAvatar) {
+          u.hasAvatar = false;
+          changed = true;
+        }
+        if (u.photoURL) {
+          u.photoURL = undefined;
+          changed = true;
+        }
+      }
+    }
+  }
+
   return changed;
 }
 
@@ -941,6 +1073,7 @@ function writeLocalDB(data: DatabaseSchema) {
 // Helper functions for Firestore database operations with strict production persistence
 async function readDB(forceRefresh = false): Promise<DatabaseSchema> {
   const isProd = process.env.NODE_ENV === "production";
+  await ensureFirestoreInitialized();
   const dbFs = forceRefresh || isProd ? dbFirestore || getFirestore() : getFirestore();
   
   if (!dbFs) {
@@ -964,8 +1097,14 @@ async function readDB(forceRefresh = false): Promise<DatabaseSchema> {
       "quizzes", "quizSubmissions", "bonuses", "confessions"
     ] as const;
     
-    const dbRef = dbFs.collection("appState");
-    const snapshots = await Promise.all(collections.map(c => dbRef.doc(c).get()));
+    const snapshots = await withFirestoreRetry(
+      async (fsInstance) => {
+        const dbRef = fsInstance.collection("appState");
+        return await Promise.all(collections.map(c => dbRef.doc(c).get()));
+      },
+      3,
+      400
+    );
     
     const db: Record<string, unknown> = {};
     collections.forEach((col, idx) => {
@@ -1063,7 +1202,20 @@ async function writeDB(data: DatabaseSchema): Promise<void> {
     const dbRef = dbFs.collection("appState");
     const batch = dbFs.batch();
 
-    batch.set(dbRef.doc("users"), { data: data.users || [] });
+    // Strip any heavy avatar strings to ensure appState/users payload stays strictly under 50KB
+    const lightweightUsers = (data.users || []).map(u => {
+      const { avatarBase64: _drop, ...userWithoutBase64 } = u;
+      const cleanPhotoURL = userWithoutBase64.photoURL && userWithoutBase64.photoURL.startsWith("data:")
+        ? `/api/profile/avatar/${userWithoutBase64.id}`
+        : userWithoutBase64.photoURL;
+      return {
+        ...userWithoutBase64,
+        photoURL: cleanPhotoURL,
+        hasAvatar: Boolean(userWithoutBase64.hasAvatar),
+      };
+    });
+
+    batch.set(dbRef.doc("users"), { data: lightweightUsers });
     batch.set(dbRef.doc("attendance"), { data: data.attendance || {} });
     batch.set(dbRef.doc("tasks"), { data: data.tasks || [] });
     batch.set(dbRef.doc("config"), data.config || initialDB.config);
@@ -1332,8 +1484,16 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
   const sanitizedUsers = (db.users || []).map(u => {
     const isSelf = user && u.id === user.id;
     const canSeePasscode = isSelf || isAdmin;
+    const isHidden = Boolean(u.hidePhotoOnBoard || u.hideNameOnBoard);
+    const shouldHidePhoto = isHidden && !isSelf && !isAdmin;
+    const effectivePhotoURL = (u.hasAvatar && !shouldHidePhoto)
+      ? `/api/profile/avatar/${u.id}?v=${u.avatarVersion || 1}`
+      : undefined;
+
+    const { avatarBase64: _drop, ...userWithoutBase64 } = u;
     return {
-      ...u,
+      ...userWithoutBase64,
+      photoURL: effectivePhotoURL,
       passcode: canSeePasscode ? u.passcode : "****",
     };
   });
@@ -1676,6 +1836,158 @@ app.get("/api/admin/export", requireAdmin, async (req: express.Request, res: exp
   }
 });
 
+// Resilient Submissions Fetch Endpoint (Admin Only, Cold-Start Guarded with Retry)
+app.get("/api/admin/submissions", requireAdmin, async (req: express.Request, res: express.Response) => {
+  try {
+    // 1. Ensure Firestore DB initialization is awaited before querying collections
+    await ensureFirestoreInitialized();
+
+    // 2. Query Firestore appState/quizSubmissions with lightweight retry wrapper
+    const submissions = await withFirestoreRetry<QuizSubmission[]>(
+      async (db) => {
+        const snap = await db.collection("appState").doc("quizSubmissions").get();
+        if (snap.exists) {
+          const val = snap.data();
+          const list = (val?.data ?? []) as QuizSubmission[];
+          return list;
+        }
+        const local = readLocalDB();
+        return local.quizSubmissions || [];
+      },
+      3,
+      400
+    );
+
+    return res.json({
+      success: true,
+      submissions,
+      quizSubmissions: submissions,
+      count: submissions.length,
+    });
+  } catch (err: unknown) {
+    console.error("Error in GET /api/admin/submissions during cold-start:", err);
+    try {
+      const db = await readDB();
+      const list = db.quizSubmissions || [];
+      return res.json({
+        success: true,
+        submissions: list,
+        quizSubmissions: list,
+        count: list.length,
+      });
+    } catch {
+      return res.status(503).json({
+        success: false,
+        error: "الخدمة مشغولة حالياً أثناء بدء التشغيل، يرجى المحاولة بعد قليل",
+        submissions: [],
+        quizSubmissions: [],
+      });
+    }
+  }
+});
+
+// Admin Anti-Cheat Security Audit Log Viewer Endpoint
+app.get("/api/admin/security-logs", requireAdmin, async (req: express.Request, res: express.Response) => {
+  try {
+    const db = await readDB();
+    const users = db.users || [];
+    const quizzes = db.quizzes || [];
+    const submissions = db.quizSubmissions || [];
+    const violations = db.quizViolations || [];
+
+    const getUserName = (userId: string) => {
+      const u = users.find(usr => usr.id === userId);
+      return u ? u.name : "مشارك غير معروف";
+    };
+
+    const getQuizTitle = (quizId: string) => {
+      const q = quizzes.find(qz => qz.id === quizId);
+      return q ? q.title : "اختبار محذوف أو غير معروف";
+    };
+
+    const securityLogs: Array<{
+      id: string;
+      userId: string;
+      userName: string;
+      quizId: string;
+      quizTitle: string;
+      timestamp: string;
+      leaveDuration: number;
+      reason?: string;
+      type?: string;
+      details?: string;
+      violationCount?: number;
+      status?: string;
+    }> = [];
+
+    // Process explicit violation records
+    for (const v of violations) {
+      securityLogs.push({
+        id: v.id || "viol_" + Math.random().toString(36).substring(2, 9),
+        userId: v.userId,
+        userName: getUserName(v.userId),
+        quizId: v.quizId,
+        quizTitle: getQuizTitle(v.quizId),
+        timestamp: v.timestamp,
+        leaveDuration: v.leaveDuration || 0,
+        reason: v.reason || "مغادرة شاشة الاختبار",
+        type: v.type || "visibility_hidden",
+        details: v.details || v.reason,
+      });
+    }
+
+    // Process embedded violations in submissions
+    for (const sub of submissions) {
+      if (sub.violations && Array.isArray(sub.violations)) {
+        for (const v of sub.violations) {
+          if (!securityLogs.some(existing => existing.id === v.id)) {
+            securityLogs.push({
+              id: v.id || "sub_viol_" + Math.random().toString(36).substring(2, 9),
+              userId: sub.userId,
+              userName: getUserName(sub.userId),
+              quizId: sub.quizId,
+              quizTitle: getQuizTitle(sub.quizId),
+              timestamp: v.timestamp,
+              leaveDuration: v.leaveDuration || 0,
+              reason: v.reason || "مغادرة شاشة الاختبار",
+              type: v.type || "visibility_hidden",
+              details: v.details || v.reason,
+              violationCount: sub.violationCount,
+              status: sub.status,
+            });
+          }
+        }
+      }
+    }
+
+    // Sort by most recent timestamp descending
+    securityLogs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+    // Flagged submissions list
+    const flaggedSubmissions = submissions
+      .filter(s => s.status === "VIOLATION_TERMINATED" || (s.violationCount && s.violationCount > 0))
+      .map(s => ({
+        ...s,
+        userName: getUserName(s.userId),
+        quizTitle: getQuizTitle(s.quizId),
+      }));
+
+    return res.json({
+      success: true,
+      logs: securityLogs,
+      flaggedSubmissions,
+      summary: {
+        totalViolations: securityLogs.length,
+        terminatedAttempts: submissions.filter(s => s.status === "VIOLATION_TERMINATED").length,
+        flaggedStudentsCount: new Set(securityLogs.map(l => l.userId)).size,
+      },
+    });
+  } catch (err: unknown) {
+    console.error("Error fetching security logs:", err);
+    return res.status(500).json({ error: "تعذر إحضار سجل الأمان ومراقبة الغش" });
+  }
+});
+
 // 1. Get current full state (Secure & Sanitized for non-admins to save bandwidth and memory)
 app.get("/api/state", async (req, res, next) => {
   try {
@@ -1701,73 +2013,94 @@ app.get("/api/state", async (req, res, next) => {
 
 // Profile Avatar Upload & Processing Engine
 app.post("/api/profile/avatar", multerUpload.single("avatar"), mutexHandler(async (req, res) => {
-  const db = await readDB();
-  const user = await authenticateUser(req, db);
-  if (!user) {
-    return res.status(401).json({ error: "انتهت الجلسة أو الرمز غير صالح، يرجى إعادة تسجيل الدخول." });
-  }
-
-  // Rate limit: maximum 3 uploads per day (last 24 hours)
-  const now = Date.now();
-  const dayMs = 24 * 60 * 60 * 1000;
-  const recentUploads = (user.avatarUploads || []).filter(t => now - t < dayMs);
-  if (recentUploads.length >= 3) {
-    return res.status(429).json({ error: "لقد تجاوزت الحد الأقصى المسموح به لرفع الصور (3 مرات في اليوم). يرجى المحاولة غداً." });
-  }
-
-  let inputBuffer: Buffer | null = null;
-  if (req.file && req.file.buffer) {
-    inputBuffer = req.file.buffer;
-  } else if (req.body && req.body.image) {
-    try {
-      inputBuffer = parseBase64Image(req.body.image).buffer;
-    } catch (e: any) {
-      return res.status(400).json({ error: e.message || "صيغة الصورة غير صالحة" });
-    }
-  }
-
-  if (!inputBuffer) {
-    return res.status(400).json({ error: "يرجى تحديد ملف صورة مرفق." });
-  }
-
-  if (inputBuffer.length > 3 * 1024 * 1024) {
-    return res.status(400).json({ error: "حجم الملف كبير جداً. الحد الأقصى المسموح به هو 3 ميجابايت." });
-  }
-
-  let avatarBase64: string;
   try {
-    const processed = await processAvatarWebP(inputBuffer);
-    avatarBase64 = processed.base64;
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message || "فشل معالجة صورة الملف الشخصي بواسطة sharp." });
+    const db = await readDB();
+    const user = await authenticateUser(req, db);
+    if (!user) {
+      return res.status(401).json({ error: "انتهت الجلسة أو الرمز غير صالح، يرجى إعادة تسجيل الدخول." });
+    }
+
+    // Rate limit: maximum 10 uploads per day (last 24 hours)
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const recentUploads = (user.avatarUploads || []).filter(t => now - t < dayMs);
+    if (recentUploads.length >= 10) {
+      return res.status(429).json({ error: "لقد تجاوزت الحد الأقصى المسموح به لرفع الصور (10 مرات في اليوم). يرجى المحاولة غداً." });
+    }
+
+    let avatarBase64: string = "";
+    const candidateBase64 = req.body?.photoURL || req.body?.avatarBase64 || req.body?.image;
+    const incomingPayloadLength = typeof candidateBase64 === "string"
+      ? candidateBase64.length
+      : (req.file?.buffer ? req.file.buffer.length : 0);
+
+    console.log(`[POST /api/profile/avatar] Received avatar upload request for user ${user.id} (${user.name}) - Incoming payload string length / buffer bytes: ${incomingPayloadLength}`);
+
+    if (typeof candidateBase64 === "string" && candidateBase64.trim().startsWith("data:image/")) {
+      const rawB64 = candidateBase64.trim();
+      try {
+        const parsed = parseBase64Image(rawB64);
+        const processed = await processAvatarWebP(parsed.buffer);
+        avatarBase64 = processed.base64;
+      } catch {
+        if (rawB64.startsWith("data:image/") && rawB64.length <= 10 * 1024 * 1024) {
+          avatarBase64 = rawB64;
+        } else {
+          return res.status(400).json({ error: "صيغة الصورة غير صالحة" });
+        }
+      }
+    } else if (typeof candidateBase64 === "string" && candidateBase64.trim().startsWith("https://")) {
+      avatarBase64 = candidateBase64.trim();
+    } else if (req.file && req.file.buffer) {
+      if (req.file.buffer.length > 10 * 1024 * 1024) {
+        return res.status(400).json({ error: "حجم الملف كبير جداً. الحد الأقصى المسموح به هو 10 ميجابايت." });
+      }
+      try {
+        const processed = await processAvatarWebP(req.file.buffer);
+        avatarBase64 = processed.base64;
+      } catch (err: any) {
+        return res.status(400).json({ error: err.message || "فشل معالجة صورة الملف الشخصي بواسطة sharp." });
+      }
+    } else {
+      return res.status(400).json({ error: "يرجى تحديد ملف صورة مرفق أو كود Base64 صالح." });
+    }
+
+    const targetUser = db.users.find(u => u.id === user.id);
+    const nextVersion = (targetUser?.avatarVersion || 0) + 1;
+    const avatarUpdatedAt = new Date(now).toISOString();
+
+    // Persist full WebP avatar Base64 exclusively to isolated Firestore avatars/{userId} collection
+    await saveAvatarToFirestore(user.id, avatarBase64, nextVersion, avatarUpdatedAt);
+    console.log(`[POST /api/profile/avatar] Successfully saved avatar for user ${user.id} to isolated collection avatars/${user.id} (version: ${nextVersion}).`);
+
+    if (targetUser) {
+      delete targetUser.avatarBase64;
+      targetUser.hasAvatar = true;
+      targetUser.avatarVersion = nextVersion;
+      targetUser.avatarUpdatedAt = avatarUpdatedAt;
+      targetUser.photoURL = `/api/profile/avatar/${user.id}?v=${nextVersion}`;
+      targetUser.avatarUploads = [...recentUploads, now];
+    }
+
+    await queueWriteDB(db);
+
+    const freshUser = db.users.find(u => u.id === user.id) || user;
+    const sanitized = sanitizeDBState(db, freshUser);
+    const { passcode: _p, avatarBase64: _dropB64, ...sanitizedUser } = freshUser as unknown as Record<string, unknown>;
+
+    return res.status(200).json({
+      success: true,
+      photoURL: `/api/profile/avatar/${user.id}?v=${nextVersion}`,
+      avatarBase64,
+      avatarVersion: nextVersion,
+      avatarUpdatedAt,
+      user: sanitizedUser,
+      db: sanitized,
+    });
+  } catch (err) {
+    console.error("[POST /api/profile/avatar] Unhandled exception occurred during avatar persistence:", err);
+    return res.status(500).json({ error: "فشل حفظ وتحديث الصورة الشخصية، يرجى المحاولة مرة أخرى." });
   }
-
-  const targetUser = db.users.find(u => u.id === user.id);
-  const nextVersion = (targetUser?.avatarVersion || 0) + 1;
-  const avatarUpdatedAt = new Date(now).toISOString();
-
-  // Save directly to Firestore for 100% persistence across container recycles
-  await saveAvatarToFirestore(user.id, avatarBase64, nextVersion, avatarUpdatedAt);
-
-  if (targetUser) {
-    targetUser.hasAvatar = true;
-    targetUser.avatarVersion = nextVersion;
-    targetUser.avatarUpdatedAt = avatarUpdatedAt;
-    targetUser.avatarUploads = [...recentUploads, now];
-  }
-
-  await queueWriteDB(db);
-
-  const freshUser = db.users.find(u => u.id === user.id) || user;
-  const sanitized = sanitizeDBState(db, freshUser);
-  const { passcode: _p, ...sanitizedUser } = freshUser as unknown as Record<string, unknown>;
-
-  return res.json({
-    success: true,
-    user: sanitizedUser,
-    db: sanitized,
-    avatarBase64,
-  });
 }));
 
 // Delete Avatar
@@ -1784,6 +2117,8 @@ app.delete("/api/profile/avatar", mutexHandler(async (req, res) => {
   const now = Date.now();
   const nextVersion = (targetUser?.avatarVersion || 0) + 1;
   if (targetUser) {
+    targetUser.photoURL = undefined;
+    targetUser.avatarBase64 = undefined;
     targetUser.hasAvatar = false;
     targetUser.avatarVersion = nextVersion;
     targetUser.avatarUpdatedAt = new Date(now).toISOString();
@@ -1819,6 +2154,8 @@ app.post("/api/admin/avatar/remove", requireAdmin, mutexHandler(async (req, res)
   await removeAvatarFromFirestore(userId);
 
   const now = Date.now();
+  targetUser.photoURL = undefined;
+  targetUser.avatarBase64 = undefined;
   targetUser.hasAvatar = false;
   targetUser.avatarVersion = (targetUser.avatarVersion || 0) + 1;
   targetUser.avatarUpdatedAt = new Date(now).toISOString();
@@ -1885,14 +2222,11 @@ app.get("/api/avatars/thumbs", async (req, res) => {
   }
 });
 
-// Stream Avatar Binary Image or Return JSON
+// Public Avatar Endpoint & HTTP Browser Caching
 app.get("/api/profile/avatar/:userId", async (req, res) => {
   try {
+    await ensureFirestoreInitialized();
     const db = await readDB();
-    const requestingUser = await authenticateUser(req, db);
-    if (!requestingUser) {
-      return res.status(401).send("Unauthorized");
-    }
 
     const targetUserId = req.params.userId;
     const targetUser = db.users.find(u => u.id === targetUserId);
@@ -1900,40 +2234,69 @@ app.get("/api/profile/avatar/:userId", async (req, res) => {
       return res.status(404).send("User not found");
     }
 
-    const isSelf = targetUser.id === requestingUser.id;
-    const isAdmin = requestingUser.role === "admin";
+    // Respect privacy settings (hidePhotoOnBoard / hideNameOnBoard)
     const isHidden = Boolean(targetUser.hidePhotoOnBoard || targetUser.hideNameOnBoard);
-    if (isHidden && !isSelf && !isAdmin) {
-      return res.status(403).send("Photo is private");
+    if (isHidden) {
+      // Optional authentication: allow only user themselves or admin to view private photo
+      const requestingUser = await authenticateUser(req, db);
+      const isSelf = requestingUser && targetUser.id === requestingUser.id;
+      const isAdmin = requestingUser && requestingUser.role === "admin";
+      if (!isSelf && !isAdmin) {
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        return res.status(403).send("Photo is private");
+      }
     }
 
-    const avatarRecord = await getAvatarFromFirestore(targetUserId);
-    if (!avatarRecord || !avatarRecord.avatarBase64 || !targetUser.hasAvatar) {
+    // Check if user has an avatar
+    if (!targetUser.hasAvatar) {
       if (req.query.format === "json" || req.headers.accept?.includes("application/json")) {
         return res.status(404).json({ success: false, avatarBase64: null, message: "Avatar not found" });
       }
       return res.status(404).send("Avatar not found");
     }
 
+    // Compute robust ETag from user's avatarVersion (or fallback to version 1)
+    const avatarVersion = targetUser.avatarVersion || 1;
+    const etag = `W/"avatar_${targetUserId}_v${avatarVersion}"`;
+
+    // Handle 304 Not Modified for conditional requests
+    if (req.headers["if-none-match"] === etag) {
+      res.setHeader("Cache-Control", "public, max-age=86400, stale-while-revalidate=604800");
+      res.setHeader("ETag", etag);
+      return res.status(304).end();
+    }
+
+    // Retrieve avatar exclusively from isolated Firestore collection avatars/{userId} (or server memory cache)
+    const avatarRecord = await getAvatarFromFirestore(targetUserId);
+    if (!avatarRecord || !avatarRecord.avatarBase64) {
+      if (req.query.format === "json" || req.headers.accept?.includes("application/json")) {
+        return res.status(404).json({ success: false, avatarBase64: null, message: "Avatar not found" });
+      }
+      return res.status(404).send("Avatar not found");
+    }
+
+    // Set robust public caching headers (1 day cache, 7 days stale-while-revalidate)
+    res.setHeader("Cache-Control", "public, max-age=86400, stale-while-revalidate=604800");
+    res.setHeader("ETag", etag);
+
     // Support JSON response format if requested
     if (req.query.format === "json") {
       return res.json({
         success: true,
         avatarBase64: avatarRecord.avatarBase64,
-        avatarVersion: avatarRecord.avatarVersion,
+        avatarVersion: avatarRecord.avatarVersion || avatarVersion,
         avatarUpdatedAt: avatarRecord.avatarUpdatedAt,
       });
     }
 
-    // Serve directly as binary image/webp response
+    // Serve directly as binary image/webp response for standard HTML <img> elements
     const base64Data = avatarRecord.avatarBase64.replace(/^data:image\/[a-z0-9-+.]+;base64,/, "");
     const imageBuffer = Buffer.from(base64Data, "base64");
 
     res.setHeader("Content-Type", "image/webp");
     res.setHeader("Content-Length", imageBuffer.length.toString());
-    res.setHeader("Cache-Control", "private, max-age=300");
     return res.send(imageBuffer);
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Error in GET /api/profile/avatar/:userId:", err);
     return res.status(500).send("Failed to stream avatar");
   }
@@ -2708,11 +3071,12 @@ app.post("/api/tasks/ai-review", requireAdmin, async (req, res, next) => {
     }
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.5-flash",
       contents: { parts: parts }
     });
 
-    const aiEvaluation = response.text || "لم يتمكن الذكاء الاصطناعي من تحليل المهمة.";
+    const rawAiEval = response.text || "لم يتمكن الذكاء الاصطناعي من تحليل المهمة.";
+    const aiEvaluation = sanitizeReasoningText(rawAiEval);
     res.json({ evaluation: aiEvaluation });
   } catch (error) {
     next(error);
@@ -3150,7 +3514,7 @@ app.post("/api/quizzes/start", mutexHandler(async (req, res) => {
 
 // 11.8 Log Quiz Security Violation (Participant or Admin)
 app.post("/api/quizzes/log-violation", mutexHandler(async (req, res) => {
-  const { quizId, userId, leaveDuration, reason } = req.body;
+  const { quizId, userId, leaveDuration, reason, type, details } = req.body;
   if (!quizId || !userId) {
     return res.status(400).json({ error: "بيانات رصد المخالفة غير مكتملة" });
   }
@@ -3178,7 +3542,9 @@ app.post("/api/quizzes/log-violation", mutexHandler(async (req, res) => {
     quizId,
     timestamp: new Date().toISOString(),
     leaveDuration: typeof leaveDuration === "number" ? Math.max(0, leaveDuration) : Math.max(0, parseFloat(leaveDuration) || 0),
-    reason: reason || "تم رصد مغادرة شاشة الاختبار / التبديل بين التطبيقات"
+    reason: reason || "تم رصد مغادرة شاشة الاختبار / التبديل بين التطبيقات",
+    type: type || "visibility_hidden",
+    details: details || reason,
   };
 
   if (!db.quizViolations) {
@@ -3252,156 +3618,39 @@ function extractRubricPoints(question: QuizQuestion): string[] {
   return extracted;
 }
 
-interface EssayGradingOutput {
-  score: number;
-  matchedRubricPoints: string[];
-  missingRubricPoints: string[];
-  gradingReasoning: string;
-}
-
-// Deterministic essay/short-answer auto-grader using Google AI Studio Gemini API with strict JSON Schema output
-async function gradeEssayWithRubric(
-  question: QuizQuestion,
-  studentAnswer: string
-): Promise<EssayGradingOutput> {
-  const rubricPoints = extractRubricPoints(question);
-  const trimmedAnswer = (studentAnswer || "").trim();
-
-  // If student wrote nothing or empty whitespace, return zero without API call
-  if (!trimmedAnswer) {
-    return {
-      score: 0,
-      matchedRubricPoints: [],
-      missingRubricPoints: [...rubricPoints],
-      gradingReasoning: "لم يقدم المشارك إجابة على هذا السؤال المقالي."
-    };
-  }
-
-  if (!process.env.GEMINI_API_KEY) {
-    console.warn("GEMINI_API_KEY is not configured; fallback zero-score pending review.");
-    return {
-      score: 0,
-      matchedRubricPoints: [],
-      missingRubricPoints: [...rubricPoints],
-      gradingReasoning: "مفتاح الذكاء الاصطناعي (Gemini API Key) غير مهيأ بالخادم؛ بانتظار المراجعة والاعتماد."
-    };
-  }
-
-  const ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+function isRawJsonErrorString(str?: string): boolean {
+  if (!str || typeof str !== "string") return false;
+  const s = str.trim();
+  if (s.startsWith("{") || s.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(s);
+      if (parsed && (parsed.error || parsed.code || parsed.statusCode || parsed.message)) {
+        return true;
+      }
+    } catch {
+      if (s.includes('"error"') || s.includes('"code"') || s.includes('503')) {
+        return true;
       }
     }
-  });
-
-  const systemInstruction = `You are a strict academic exam grader. Compare the student's submission against the mandatory rubric points.
-Rules:
-1. Evaluate each rubric point independently as boolean (matched: true/false).
-2. Do NOT award partial credit for vague, tangential, or unmentioned rubric items.
-3. Award exactly (Total Points / Total Rubric Items) for each matched item.
-4. Output concise grading reasoning in Arabic.`;
-
-  const totalPoints = question.points || 1;
-  const pointPerItem = rubricPoints.length > 0 ? (totalPoints / rubricPoints.length) : totalPoints;
-
-  const prompt = `نص السؤال (Question):
-"${question.questionText}"
-
-الدرجة الكلية للسؤال (Total Points): ${totalPoints} نقطة
-معايير التقييم الإلزامية المطلوبة للحصول على الدرجة كاملة (${rubricPoints.length} معيار، قيمة كل معيار مستوفى = ${pointPerItem.toFixed(3)} نقطة):
-${rubricPoints.map((pt, i) => `${i + 1}. ${pt}`).join("\n")}
-
-إجابة الطالب المقدمة (Student Answer):
-"${trimmedAnswer}"
-
-تعليمات التقييم الرياضي الصارم:
-- قم بتصنيف كل عنصر من عناصر التقييم السابقة بشكل ثنائي بحت (إما مستوفى matched أو مفقود missing).
-- لا تتساهل ولا تمنح درجات للتلميحات العامة أو الكلمات الإنشائية الغامضة غير المحددة.
-- كل عنصر تم استيفاؤه بدقة يضاف لقائمة matchedRubricPoints.
-- كل عنصر لم يستوفه الطالب بوضوح يضاف لقائمة missingRubricPoints.
-- الدرجة (score) يجب أن تساوي تماماً: (عدد العناصر المستوفاة × ${pointPerItem.toFixed(3)}).
-- اكتب في gradingReasoning تحليلاً أكاديمياً دقيقاً ومختصراً باللغة العربية يوضح ما استوفاه وما فاته.`;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            score: {
-              type: Type.NUMBER,
-              description: "Total calculated points earned strictly based on matched rubric items"
-            },
-            matchedRubricPoints: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "List of mandatory rubric points that were explicitly and accurately matched in the student's answer"
-            },
-            missingRubricPoints: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "List of mandatory rubric points that were omitted, vague, incomplete, or incorrect"
-            },
-            gradingReasoning: {
-              type: Type.STRING,
-              description: "Concise academic evaluation commentary in Arabic explaining the grading decision"
-            }
-          },
-          required: ["score", "matchedRubricPoints", "missingRubricPoints", "gradingReasoning"]
-        }
-      }
-    });
-
-    const text = response.text || "{}";
-    const parsed = JSON.parse(text);
-
-    const matchedRubricPoints: string[] = Array.isArray(parsed.matchedRubricPoints)
-      ? parsed.matchedRubricPoints.map((s: unknown) => String(s).trim()).filter(Boolean)
-      : [];
-
-    const missingRubricPoints: string[] = Array.isArray(parsed.missingRubricPoints)
-      ? parsed.missingRubricPoints.map((s: unknown) => String(s).trim()).filter(Boolean)
-      : rubricPoints.filter(p => !matchedRubricPoints.includes(p));
-
-    // Enforce strict mathematical point allocation without leniency:
-    // (Total Points / Total Rubric Items) * number of matched items
-    const rawCalculated = rubricPoints.length > 0
-      ? (totalPoints / rubricPoints.length) * matchedRubricPoints.length
-      : (typeof parsed.score === "number" ? parsed.score : 0);
-
-    const finalScore = Math.max(0, Math.min(totalPoints, Math.round(rawCalculated * 100) / 100));
-
-    const gradingReasoning = typeof parsed.gradingReasoning === "string" && parsed.gradingReasoning.trim().length > 0
-      ? parsed.gradingReasoning.trim()
-      : `تم التقييم الآلي: استوفى ${matchedRubricPoints.length} من أصل ${rubricPoints.length} عناصر إلزامية (${finalScore} من ${totalPoints} نقطة).`;
-
-    return {
-      score: finalScore,
-      matchedRubricPoints,
-      missingRubricPoints,
-      gradingReasoning
-    };
-  } catch (err: unknown) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    console.error("Gemini essay auto-grading failed:", errorMsg);
-
-    return {
-      score: 0,
-      matchedRubricPoints: [],
-      missingRubricPoints: [...rubricPoints],
-      gradingReasoning: `تعذر إتمام التقييم الآلي مؤقتاً (${errorMsg}). بانتظار المراجعة والاعتماد.`
-    };
   }
+  return (
+    s.includes('{"error"') ||
+    s.includes('"code":503') ||
+    s.includes('503 UNAVAILABLE') ||
+    s.includes('RESOURCE_EXHAUSTED') ||
+    (s.includes('UNAVAILABLE') && s.includes('{'))
+  );
 }
 
-// 12. Submit Quiz Answers (Participant)
-app.post("/api/quizzes/submit", mutexHandler(async (req, res) => {
+function sanitizeReasoningText(text?: string): string {
+  if (!text || typeof text !== "string" || isRawJsonErrorString(text)) {
+    return "تنبيه: الخدمة آلياً تحت الضغط المؤقت - بانتظار الاعتماد اليدوي من المشرف";
+  }
+  return text.trim();
+}
+
+// 12. Instant Sub-Second Deterministic Quiz Submission Endpoint
+app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, res) => {
   const { quizId, userId, answers, status } = req.body;
   if (!quizId || !userId || !answers) {
     return res.status(400).json({ error: "بيانات الإجابة غير مكتملة" });
@@ -3466,7 +3715,7 @@ app.post("/api/quizzes/submit", mutexHandler(async (req, res) => {
         pointsEarned,
         correct: isCorrect,
         studentAnswer,
-        feedback: isCorrect ? "إجابة صحيحة تماماً!" : `إجابة غير صحيحة. الإجابة الصح هي: ${question.options?.[parseInt(question.correctAnswer || "0", 10)] || ""}`
+        feedback: isCorrect ? "إجابة صحيحة تماماً!" : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${question.options?.[parseInt(question.correctAnswer || "0", 10)] || ""}`
       };
       totalScore += pointsEarned;
     } else if (question.type === "boolean") {
@@ -3476,57 +3725,31 @@ app.post("/api/quizzes/submit", mutexHandler(async (req, res) => {
         pointsEarned,
         correct: isCorrect,
         studentAnswer,
-        feedback: isCorrect ? "إجابة صحيحة!" : `إجابة غير صحيحة. الإجابة الصح هي: ${(question.correctAnswer === "true" ? "صح" : "خطأ")}`
+        feedback: isCorrect ? "إجابة صحيحة!" : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${(question.correctAnswer === "true" ? "صح" : "خطأ")}`
       };
       totalScore += pointsEarned;
     } else if (question.type === "essay") {
-      // Automatic Rubric Evaluation on Submit if not violation and Gemini is configured
-      if (!isViolation && process.env.GEMINI_API_KEY) {
-        try {
-          const autoResult = await gradeEssayWithRubric(question, studentAnswer);
-          essayGrades[question.id] = {
-            questionId: question.id,
-            score: autoResult.score,
-            matchedRubricPoints: autoResult.matchedRubricPoints,
-            missingRubricPoints: autoResult.missingRubricPoints,
-            gradingReasoning: autoResult.gradingReasoning,
-            status: "auto_graded",
-            gradedAt: new Date().toISOString()
-          };
-          questionResults[question.id] = {
-            pointsEarned: autoResult.score,
-            correct: autoResult.score >= (question.points / 2),
-            studentAnswer,
-            feedback: autoResult.gradingReasoning,
-            matchedRubricPoints: autoResult.matchedRubricPoints,
-            missingRubricPoints: autoResult.missingRubricPoints,
-            gradingReasoning: autoResult.gradingReasoning,
-            autoGraded: true
-          };
-          totalScore += autoResult.score;
-        } catch {
-          questionResults[question.id] = {
-            pointsEarned: 0,
-            correct: false,
-            studentAnswer,
-            feedback: "بانتظار تصحيح الخادم..."
-          };
-        }
-      } else {
-        questionResults[question.id] = {
-          pointsEarned: 0,
-          correct: false,
-          studentAnswer,
-          feedback: "بانتظار تصحيح الخادم..."
-        };
-      }
+      essayGrades[question.id] = {
+        questionId: question.id,
+        score: 0,
+        gradingReasoning: "بانتظار تصحيح المشرف...",
+        status: "pending_manual_review",
+        gradedAt: new Date().toISOString()
+      };
+      questionResults[question.id] = {
+        pointsEarned: 0,
+        correct: false,
+        studentAnswer,
+        feedback: "بانتظار تصحيح المشرف...",
+        status: "pending_manual_review"
+      };
     }
   }
 
   totalScore = Math.round(totalScore * 100) / 100;
-  const submissionStatus: "grading" | "completed" | "VIOLATION_TERMINATED" = isViolation
+  const submissionStatus: "pending_manual_review" | "completed" | "VIOLATION_TERMINATED" = isViolation
     ? "VIOLATION_TERMINATED"
-    : (hasEssay ? "grading" : "completed");
+    : (hasEssay ? "pending_manual_review" : "completed");
 
   const newSubmission: QuizSubmission = {
     id: "sub_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
@@ -3563,12 +3786,11 @@ app.post("/api/quizzes/submit", mutexHandler(async (req, res) => {
     db.quizSubmissions.push(newSubmission);
   }
 
-  // Send automatic notification
   const participant = db.users.find(u => u.id === userId);
   const notifMsg = isViolation
     ? `⚠️ تم إيقاف وتسليم اختبار "${quiz.title}" للمشارك ${participant?.name || ""} بسبب رصد مخالفة أمنية ومغادرة شاشة الامتحان.`
-    : submissionStatus === "grading"
-      ? `تهانينا للمشارك ${participant?.name || ""}! لقد قمت بتسليم إجاباتك لاختبار "${quiz.title}" بنجاح وهو الآن بانتظار تصحيح الجزء المقالي بواسطة الخادم! 🎉`
+    : submissionStatus === "pending_manual_review"
+      ? `تهانينا للمشارك ${participant?.name || ""}! لقد قمت بتسليم إجاباتك لاختبار "${quiz.title}" بنجاح وهو الآن بانتظار تصحيح الجزء المقالي من المشرف! 🎉`
       : `تهانينا للمشارك ${participant?.name || ""}! لقد أنجزت حل اختبار "${quiz.title}" بنجاح وحصلت على ${totalScore} من أصل ${quiz.points} نقطة! 🎉`;
   
   const newNotification: AppNotification = {
@@ -3586,22 +3808,22 @@ app.post("/api/quizzes/submit", mutexHandler(async (req, res) => {
   }
 
   await queueWriteDB(db);
-  res.json({
+  res.status(200).json({
     message: isViolation
       ? "تم إيقاف الامتحان وتسليم المحاولة لمخالفة قواعد النزاهة الأمنية."
-      : submissionStatus === "grading"
-        ? "تم تسليم الاختبار بنجاح وبانتظار تصحيح الجزء المقالي!"
+      : submissionStatus === "pending_manual_review"
+        ? "تم تسليم الاختبار بنجاح وبانتظار تصحيح الجزء المقالي من المشرف!"
         : "تم تسليم وحل الاختبار وتقييمه بنجاح!",
     submission: existingIdx !== -1 ? db.quizSubmissions[existingIdx] : newSubmission,
     db: sanitizeDBState(db, user)
   });
 }));
 
-// 12.5 Grade Quiz Essay Questions (Admin Manual Approval or Override)
-app.post("/api/quizzes/grade-essay", requireAdmin, mutexHandler(async (req, res) => {
-  const { submissionId, questionGrades } = req.body;
-  if (!submissionId || !questionGrades) {
-    return res.status(400).json({ error: "بيانات رصد الدرجة غير مكتملة" });
+// 12.5 Admin Manual Essay Grading Endpoint
+app.post(["/api/admin/grade-essay", "/api/admin/grade-essay-manual", "/api/admin/grade-essays", "/api/quizzes/grade-essay"], requireAdmin, mutexHandler(async (req, res) => {
+  const { submissionId, questionGrades, questionId, score, feedback: singleFeedback } = req.body;
+  if (!submissionId) {
+    return res.status(400).json({ error: "معرف تسليم الاختبار مطلوب" });
   }
 
   const db = await readDB();
@@ -3622,26 +3844,42 @@ app.post("/api/quizzes/grade-essay", requireAdmin, mutexHandler(async (req, res)
     submission.questionResults = {};
   }
 
-  // Update essay question results
-  for (const qId of Object.keys(questionGrades)) {
+  // Construct standardized question grades map
+  const gradesMap: Record<string, { pointsEarned: number; feedback?: string }> = {};
+  
+  if (questionId !== undefined && (score !== undefined || req.body.pointsEarned !== undefined)) {
+    const pts = score !== undefined ? score : req.body.pointsEarned;
+    gradesMap[questionId] = {
+      pointsEarned: parseFloat(pts || 0),
+      feedback: singleFeedback
+    };
+  } else if (questionGrades && typeof questionGrades === "object") {
+    for (const qId of Object.keys(questionGrades)) {
+      const item = questionGrades[qId];
+      const pts = item.pointsEarned !== undefined ? item.pointsEarned : (item.score !== undefined ? item.score : 0);
+      gradesMap[qId] = {
+        pointsEarned: parseFloat(pts || 0),
+        feedback: item.feedback || item.gradingReasoning
+      };
+    }
+  } else {
+    return res.status(400).json({ error: "بيانات درجة السؤال المقالي غير مكتملة" });
+  }
+
+  for (const qId of Object.keys(gradesMap)) {
     const question = quiz.questions.find(q => q.id === qId);
     if (question && question.type === "essay") {
-      const grade = questionGrades[qId];
+      const grade = gradesMap[qId];
       const maxPoints = question.points;
-      const pointsEarned = Math.max(0, Math.min(maxPoints, parseFloat(grade.pointsEarned || 0)));
+      const pointsEarned = Math.max(0, Math.min(maxPoints, parseFloat(String(grade.pointsEarned || 0))));
       const correct = pointsEarned >= (maxPoints / 2);
-      const feedback = grade.feedback?.trim() || "تم التقييم ورصد الدرجة بنجاح.";
-
-      const existingAuto = submission.essayGrades[qId];
-      const isOverride = existingAuto && existingAuto.score !== pointsEarned;
+      const feedback = grade.feedback?.trim() || "تم تصحيح الإجابة المقالية يدوياً ورصد الدرجة بنجاح.";
 
       submission.essayGrades[qId] = {
         questionId: qId,
         score: pointsEarned,
-        matchedRubricPoints: existingAuto?.matchedRubricPoints || [],
-        missingRubricPoints: existingAuto?.missingRubricPoints || [],
         gradingReasoning: feedback,
-        status: isOverride ? "admin_overridden" : "admin_approved",
+        status: "admin_approved",
         gradedAt: new Date().toISOString()
       };
 
@@ -3649,13 +3887,15 @@ app.post("/api/quizzes/grade-essay", requireAdmin, mutexHandler(async (req, res)
         ...submission.questionResults[qId],
         pointsEarned,
         correct,
+        studentAnswer: submission.answers[qId] || "",
         feedback,
-        autoGraded: false
+        autoGraded: false,
+        status: "graded"
       };
     }
   }
 
-  // Recalculate totalScore
+  // Synchronously recalculate total quiz score
   let totalScore = 0;
   for (const question of quiz.questions) {
     const result = submission.questionResults[question.id];
@@ -3665,16 +3905,16 @@ app.post("/api/quizzes/grade-essay", requireAdmin, mutexHandler(async (req, res)
   }
 
   submission.totalScore = Math.round(totalScore * 100) / 100;
-  submission.status = "completed";
+  submission.status = "graded";
   submission.gradedAt = new Date().toISOString();
 
-  // Send notification to user
   const participant = db.users.find(u => u.id === submission.userId);
-  const notifMsg = `🔔 تم الانتهاء من تصحيح ورصد درجات اختبار "${quiz.title}" للمشارك ${participant?.name || ""}! الدرجة النهائية: ${totalScore} من أصل ${quiz.points} نقطة. 🎉`;
+  const notifMsg = `🔔 تم تصحيح الأسئلة المقالية ورصد درجاتك في اختبار "${quiz.title}"! الدرجة النهائية: ${submission.totalScore} من أصل ${quiz.points} نقطة. 🎉`;
   
   const newNotification: AppNotification = {
     id: "notif_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
     message: notifMsg,
+    userId: submission.userId,
     createdAt: new Date().toISOString()
   };
   
@@ -3686,112 +3926,11 @@ app.post("/api/quizzes/grade-essay", requireAdmin, mutexHandler(async (req, res)
     db.notifications = db.notifications.slice(-50);
   }
 
-  const user = await authenticateUser(req);
   await queueWriteDB(db);
-  res.json({ message: "تم تصحيح وحفظ درجات الأسئلة المقالية بنجاح", submission, db: sanitizeDBState(db, user) });
-}));
-
-// 12.6 Strict Rubric-based Essay Auto-Grading Engine (Admin Only)
-// POST /api/admin/grade-essays and POST /api/admin/grade-essay
-app.post(["/api/admin/grade-essays", "/api/admin/grade-essay"], requireAdmin, mutexHandler(async (req, res) => {
-  const { submissionId, questionId, quizId } = req.body || {};
   const user = await authenticateUser(req);
-  const db = await readDB();
-
-  if (!db.quizSubmissions || db.quizSubmissions.length === 0) {
-    return res.status(404).json({ error: "لا توجد تسليمات اختبارات مسجلة في النظام" });
-  }
-
-  // Identify target submissions
-  let targetSubmissions: QuizSubmission[] = [];
-  if (submissionId) {
-    const sub = db.quizSubmissions.find(s => s.id === submissionId);
-    if (!sub) {
-      return res.status(404).json({ error: "تسليم الاختبار المطلوب غير موجود" });
-    }
-    targetSubmissions = [sub];
-  } else if (quizId) {
-    targetSubmissions = db.quizSubmissions.filter(s => s.quizId === quizId && s.status === "grading");
-    if (targetSubmissions.length === 0) {
-      // Fallback: look for submissions for this quiz that have essay questions
-      targetSubmissions = db.quizSubmissions.filter(s => s.quizId === quizId && s.status !== "started" && s.status !== "VIOLATION_TERMINATED");
-    }
-  } else {
-    // All pending grading submissions across all quizzes
-    targetSubmissions = db.quizSubmissions.filter(s => s.status === "grading");
-  }
-
-  if (targetSubmissions.length === 0) {
-    return res.json({
-      message: "لا توجد إجابات مقالية معلقة بانتظار التقييم التلقائي.",
-      autoGradedCount: 0,
-      db: sanitizeDBState(db, user)
-    });
-  }
-
-  let autoGradedCount = 0;
-
-  for (const submission of targetSubmissions) {
-    const quiz = db.quizzes?.find(q => q.id === submission.quizId);
-    if (!quiz) continue;
-
-    const essayQuestions = quiz.questions.filter(q => q.type === "essay" && (!questionId || q.id === questionId));
-    if (essayQuestions.length === 0) continue;
-
-    if (!submission.essayGrades) {
-      submission.essayGrades = {};
-    }
-    if (!submission.questionResults) {
-      submission.questionResults = {};
-    }
-
-    for (const q of essayQuestions) {
-      const studentAnswer = (submission.answers?.[q.id] || "").toString();
-      const gradingResult = await gradeEssayWithRubric(q, studentAnswer);
-
-      // Save auto-calculated score under essayGrades with status "auto_graded"
-      submission.essayGrades[q.id] = {
-        questionId: q.id,
-        score: gradingResult.score,
-        matchedRubricPoints: gradingResult.matchedRubricPoints,
-        missingRubricPoints: gradingResult.missingRubricPoints,
-        gradingReasoning: gradingResult.gradingReasoning,
-        status: "auto_graded",
-        gradedAt: new Date().toISOString()
-      };
-
-      // Also update questionResults for real-time review
-      submission.questionResults[q.id] = {
-        pointsEarned: gradingResult.score,
-        correct: gradingResult.score >= (q.points / 2),
-        studentAnswer,
-        feedback: gradingResult.gradingReasoning,
-        matchedRubricPoints: gradingResult.matchedRubricPoints,
-        missingRubricPoints: gradingResult.missingRubricPoints,
-        gradingReasoning: gradingResult.gradingReasoning,
-        autoGraded: true
-      };
-
-      autoGradedCount++;
-    }
-
-    // Recalculate totalScore for the submission
-    let totalScore = 0;
-    for (const q of quiz.questions) {
-      const resItem = submission.questionResults[q.id];
-      if (resItem) {
-        totalScore += resItem.pointsEarned || 0;
-      }
-    }
-    submission.totalScore = Math.round(totalScore * 100) / 100;
-  }
-
-  await queueWriteDB(db);
-
   res.json({
-    message: `تم بنجاح تصحيح ورصد التقييم الذكي الصارم لـ ${autoGradedCount} سؤال مقالي!`,
-    autoGradedCount,
-    submission: targetSubmissions.length === 1 ? targetSubmissions[0] : undefined,
+    message: "تم حفظ ورصد درجات الأسئلة المقالية وتحديث النتيجة النهائية بنجاح",
+    submission,
     db: sanitizeDBState(db, user)
   });
 }));

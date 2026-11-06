@@ -162,6 +162,8 @@ export default function Leaderboard({
               </div>
               <div className="mb-2 mt-4 flex justify-center">
                 <Avatar
+                  src={topThree[1].photoURL}
+                  name={topThree[1].name}
                   userId={topThree[1].id}
                   userName={topThree[1].name}
                   size={512}
@@ -213,6 +215,8 @@ export default function Leaderboard({
               
               <div className="mb-2 mt-5 flex justify-center">
                 <Avatar
+                  src={topThree[0].photoURL}
+                  name={topThree[0].name}
                   userId={topThree[0].id}
                   userName={topThree[0].name}
                   size={512}
@@ -254,6 +258,8 @@ export default function Leaderboard({
               </div>
               <div className="mb-2 mt-4 flex justify-center">
                 <Avatar
+                  src={topThree[2].photoURL}
+                  name={topThree[2].name}
                   userId={topThree[2].id}
                   userName={topThree[2].name}
                   size={512}
@@ -339,6 +345,8 @@ export default function Leaderboard({
                     <td className="py-3 md:py-4 px-3 md:px-4 text-sm sm:text-base md:text-lg font-black text-slate-900 dark:text-slate-100">
                       <div className="flex items-center gap-3">
                         <Avatar
+                          src={score.photoURL}
+                          name={score.name}
                           userId={score.id}
                           userName={score.name}
                           size={96}
@@ -423,6 +431,8 @@ export default function Leaderboard({
                 {/* Top Bar with Title */}
                 <div className="flex items-center gap-3 border-b border-slate-200 dark:border-slate-800 pb-3 mb-4 pr-8">
                   <Avatar
+                    src={selectedUserStats.photoURL}
+                    name={selectedUserStats.name}
                     userId={selectedUserStats.id}
                     userName={selectedUserStats.name}
                     size={96}

@@ -1,4 +1,5 @@
-import { DatabaseState, User, QuizQuestion, WebPushSubscription } from "../types";
+import { DatabaseState, User, UserProfile, QuizQuestion, WebPushSubscription } from "../types";
+export type { UserProfile };
 
 export class ApiError extends Error {
   constructor(message: string, public status?: number) {
@@ -50,6 +51,156 @@ export function clearSession(): void {
 // Automatically clear legacy auth keys on module load
 if (typeof window !== "undefined") {
   clearLegacySessionKeys();
+}
+
+export function getQuizAnswerBackupKey(quizId: string, userId: string): string {
+  return `quiz_answers_backup_${quizId}_${userId}`;
+}
+
+export function saveQuizAnswerBackup(quizId: string, userId: string, answers: Record<string, string>): void {
+  if (typeof window === "undefined") return;
+  try {
+    const key = getQuizAnswerBackupKey(quizId, userId);
+    localStorage.setItem(key, JSON.stringify({ quizId, answers, timestamp: Date.now() }));
+  } catch {}
+}
+
+export function getQuizAnswerBackup(quizId: string, userId: string): Record<string, string> | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const key = getQuizAnswerBackupKey(quizId, userId);
+    const saved = localStorage.getItem(key);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (parsed && parsed.quizId === quizId && parsed.answers && typeof parsed.answers === "object") {
+        return parsed.answers;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function clearQuizAnswerBackup(quizId: string, userId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const key = getQuizAnswerBackupKey(quizId, userId);
+    localStorage.removeItem(key);
+  } catch {}
+}
+
+// --- Network Status & Offline Queue Engine ---
+const OFFLINE_SUBMISSIONS_QUEUE_KEY = "marathon_offline_submissions_queue";
+
+export interface OfflineSubmissionItem {
+  id: string;
+  quizId: string;
+  userId: string;
+  answers: Record<string, string>;
+  status?: "started" | "grading" | "completed" | "VIOLATION_TERMINATED";
+  timestamp: string;
+  retries: number;
+}
+
+export function isNetworkOnline(): boolean {
+  if (typeof navigator === "undefined") return true;
+  return navigator.onLine;
+}
+
+export function subscribeNetworkStatus(callback: (online: boolean) => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  const handleOnline = () => {
+    callback(true);
+    processOfflineSubmissionsQueue();
+  };
+  const handleOffline = () => callback(false);
+
+  window.addEventListener("online", handleOnline);
+  window.addEventListener("offline", handleOffline);
+
+  return () => {
+    window.removeEventListener("online", handleOnline);
+    window.removeEventListener("offline", handleOffline);
+  };
+}
+
+export function getOfflineSubmissionsQueue(): OfflineSubmissionItem[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(OFFLINE_SUBMISSIONS_QUEUE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveOfflineSubmissionsQueue(queue: OfflineSubmissionItem[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(OFFLINE_SUBMISSIONS_QUEUE_KEY, JSON.stringify(queue));
+  } catch {}
+}
+
+export function enqueueOfflineSubmission(item: Omit<OfflineSubmissionItem, "id" | "timestamp" | "retries">): OfflineSubmissionItem {
+  const queue = getOfflineSubmissionsQueue();
+  const existingIdx = queue.findIndex(q => q.quizId === item.quizId && q.userId === item.userId);
+  const newItem: OfflineSubmissionItem = {
+    ...item,
+    id: "offsub_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+    timestamp: new Date().toISOString(),
+    retries: 0,
+  };
+  if (existingIdx >= 0) {
+    queue[existingIdx] = newItem;
+  } else {
+    queue.push(newItem);
+  }
+  saveOfflineSubmissionsQueue(queue);
+  return newItem;
+}
+
+let isSyncingQueue = false;
+
+export async function processOfflineSubmissionsQueue(): Promise<void> {
+  if (typeof window === "undefined" || !isNetworkOnline() || isSyncingQueue) return;
+  const queue = getOfflineSubmissionsQueue();
+  if (queue.length === 0) return;
+
+  isSyncingQueue = true;
+  const remainingQueue: OfflineSubmissionItem[] = [];
+
+  for (const item of queue) {
+    try {
+      await fetchJson<{ db: DatabaseState }>("/api/quizzes/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          quizId: item.quizId,
+          userId: item.userId,
+          answers: item.answers,
+          status: item.status,
+        }),
+      });
+      clearQuizAnswerBackup(item.quizId, item.userId);
+      console.log(`[Offline Queue] Successfully synced submission for quiz ${item.quizId}`);
+    } catch (err) {
+      console.warn(`[Offline Queue] Failed sync attempt ${item.retries + 1} for quiz ${item.quizId}:`, err);
+      item.retries += 1;
+      if (item.retries < 10) {
+        remainingQueue.push(item);
+      }
+    }
+  }
+
+  saveOfflineSubmissionsQueue(remainingQueue);
+  isSyncingQueue = false;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => {
+    processOfflineSubmissionsQueue();
+  });
 }
 
 export function getAuthHeaders(customHeaders?: HeadersInit): Headers {
@@ -144,6 +295,83 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+/**
+ * Client-side canvas rendering before upload:
+ * a. Load file onto an HTML5 <canvas> resized to 300x300 pixels.
+ * b. Convert canvas to WebP Base64 format with 0.85 quality (canvas.toDataURL('image/webp', 0.85)).
+ * c. Post this Data URL directly to the avatar backend endpoint.
+ */
+export async function compressAvatarImageToBase64(
+  fileOrDataUrl: File | Blob | string,
+  targetSize = 300,
+  quality = 0.85
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const processImageSource = (src: string) => {
+      const img = new Image();
+      img.onload = () => {
+        const width = img.naturalWidth || img.width;
+        const height = img.naturalHeight || img.height;
+
+        if (width <= 0 || height <= 0) {
+          reject(new Error("أبعاد الصورة غير صالحة"));
+          return;
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = targetSize;
+        canvas.height = targetSize;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          reject(new Error("تعذر إنشاء سياق رسم الكانفاس"));
+          return;
+        }
+
+        // Center-crop (cover) into exact targetSize x targetSize
+        const scale = Math.max(targetSize / width, targetSize / height);
+        const scaledWidth = width * scale;
+        const scaledHeight = height * scale;
+        const offsetX = (targetSize - scaledWidth) / 2;
+        const offsetY = (targetSize - scaledHeight) / 2;
+
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(img, offsetX, offsetY, scaledWidth, scaledHeight);
+
+        // Convert to WebP Base64 format with 0.85 quality
+        let dataUrl = canvas.toDataURL("image/webp", quality);
+        if (!dataUrl.startsWith("data:image/webp")) {
+          dataUrl = canvas.toDataURL("image/jpeg", quality);
+        }
+
+        resolve(dataUrl);
+      };
+
+      img.onerror = () => {
+        reject(new Error("تعذر قراءة وتحميل الصورة"));
+      };
+
+      img.src = src;
+    };
+
+    if (typeof fileOrDataUrl === "string") {
+      processImageSource(fileOrDataUrl);
+    } else {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result;
+        if (typeof result === "string") {
+          processImageSource(result);
+        } else {
+          reject(new Error("فشل قراءة ملف الصورة"));
+        }
+      };
+      reader.onerror = () => reject(new Error("تعذر قراءة ملف الصورة المحدد"));
+      reader.readAsDataURL(fileOrDataUrl);
+    }
+  });
 }
 
 export const ApiService = {
@@ -241,35 +469,30 @@ export const ApiService = {
   },
 
   /**
-   * Grade essay question manually or override
+   * Grade essay question manually by admin
    */
-  async gradeEssay(
+  async gradeEssayManual(
     submissionId: string,
     questionGrades: Record<string, { pointsEarned: number; feedback?: string }>
-  ): Promise<{ db: DatabaseState }> {
-    return fetchJson<{ db: DatabaseState }>("/api/quizzes/grade-essay", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ submissionId, questionGrades }),
-    });
+  ): Promise<{ message: string; db: DatabaseState; submission?: any }> {
+    return this.gradeEssay(submissionId, questionGrades);
   },
 
   /**
-   * Auto-grade essay submissions using Gemini strict rubric engine
+   * Grade essay question manually via POST /api/admin/grade-essay
    */
-  async autoGradeEssays(params?: {
-    submissionId?: string;
-    questionId?: string;
-    quizId?: string;
-  }): Promise<{ message: string; autoGradedCount?: number; db: DatabaseState; submission?: any }> {
-    return fetchJson<{ message: string; autoGradedCount?: number; db: DatabaseState; submission?: any }>(
-      "/api/admin/grade-essays",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params || {}),
-      }
-    );
+  async gradeEssay(
+    submissionId: string,
+    questionGrades: Record<string, { pointsEarned: number; feedback?: string }> | { questionId: string; score: number; feedback?: string }
+  ): Promise<{ message: string; db: DatabaseState; submission?: any }> {
+    const body = typeof questionGrades === "object" && "questionId" in questionGrades
+      ? { submissionId, questionId: questionGrades.questionId, score: questionGrades.score, feedback: questionGrades.feedback }
+      : { submissionId, questionGrades };
+    return fetchJson<{ message: string; db: DatabaseState; submission?: any }>("/api/admin/grade-essay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
   },
 
   /**
@@ -617,7 +840,7 @@ export const ApiService = {
   },
 
   /**
-   * Submit quiz answers
+   * Submit quiz answers with offline queueing resilience
    */
   async submitQuiz(
     quizId: string,
@@ -625,27 +848,55 @@ export const ApiService = {
     answers: Record<string, string>,
     status?: "started" | "grading" | "completed" | "VIOLATION_TERMINATED"
   ): Promise<{ db: DatabaseState }> {
-    return fetchJson<{ db: DatabaseState }>("/api/quizzes/submit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quizId, userId, answers, status }),
-    });
+    saveQuizAnswerBackup(quizId, userId, answers);
+
+    if (!isNetworkOnline()) {
+      enqueueOfflineSubmission({ quizId, userId, answers, status });
+      throw new ApiError("معطل مؤقتاً بسبب انقطاع الإنترنت 📡. تم حفظ إجاباتك محلياً وستتم المزامنة تلقائياً فور عودة الاتصال.");
+    }
+
+    try {
+      const res = await fetchJson<{ db: DatabaseState }>("/api/quizzes/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ quizId, userId, answers, status }),
+      });
+      clearQuizAnswerBackup(quizId, userId);
+      return res;
+    } catch (err: unknown) {
+      if (err instanceof ApiError && (err.status === 503 || err.status === 0 || !isNetworkOnline())) {
+        enqueueOfflineSubmission({ quizId, userId, answers, status });
+      }
+      throw err;
+    }
   },
 
   /**
-   * Log an exam proctoring violation (e.g. app-switching / focus loss)
+   * Log an exam proctoring violation (e.g. app-switching / focus loss / copy-paste attempt)
    */
   async logQuizViolation(
     quizId: string,
     userId: string,
     leaveDuration: number,
-    reason?: string
+    reason?: string,
+    type?: string,
+    details?: string
   ): Promise<{ db: DatabaseState }> {
+    if (!isNetworkOnline()) {
+      return { db: await this.getState().catch(() => ({ users: [], attendance: {}, tasks: [], config: { durationWeeks: 12, points: { meeting: 20, liturgy: 20, praise: 15 } } } as DatabaseState)) };
+    }
     return fetchJson<{ db: DatabaseState }>("/api/quizzes/log-violation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quizId, userId, leaveDuration, reason }),
+      body: JSON.stringify({ quizId, userId, leaveDuration, reason, type, details }),
     });
+  },
+
+  /**
+   * Expose Admin Security Audit Logs for flagged student submissions and violations
+   */
+  async getSecurityLogs(): Promise<{ success: boolean; logs: any[]; flaggedSubmissions: any[]; summary: any }> {
+    return fetchJson<{ success: boolean; logs: any[]; flaggedSubmissions: any[]; summary: any }>("/api/admin/security-logs");
   },
 
   /**
@@ -672,6 +923,13 @@ export const ApiService = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ quizId, userId }),
     });
+  },
+
+  /**
+   * Fetch quiz submissions directly with cold-start resilience (Admin only)
+   */
+  async getAdminSubmissions(): Promise<{ success: boolean; submissions: any[]; quizSubmissions: any[]; count?: number }> {
+    return fetchJson<{ success: boolean; submissions: any[]; quizSubmissions: any[]; count?: number }>("/api/admin/submissions");
   },
 
   /**
@@ -718,30 +976,32 @@ export const ApiService = {
   },
 
   /**
-   * Upload user profile avatar (accepts File or base64)
+   * Upload user profile avatar (compressed client-side to 300x300 WebP Base64 Data URL with 0.85 quality)
    */
-  async uploadAvatar(fileOrBase64: File | string): Promise<{ success: boolean; user: User; db: DatabaseState; avatarBase64?: string }> {
-    if (fileOrBase64 instanceof File) {
-      const formData = new FormData();
-      formData.append("avatar", fileOrBase64);
-      return fetchJson<{ success: boolean; user: User; db: DatabaseState; avatarBase64?: string }>("/api/profile/avatar", {
-        method: "POST",
-        body: formData,
-      });
+  async uploadAvatar(fileOrBase64: File | Blob | string): Promise<{ success: boolean; user: User; db: DatabaseState; photoURL?: string; avatarBase64?: string; avatarVersion?: number; avatarUpdatedAt?: string }> {
+    let base64String: string;
+    if (typeof fileOrBase64 === "string" && fileOrBase64.startsWith("data:image/webp;base64,")) {
+      base64String = await compressAvatarImageToBase64(fileOrBase64, 300, 0.85);
     } else {
-      return fetchJson<{ success: boolean; user: User; db: DatabaseState; avatarBase64?: string }>("/api/profile/avatar", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: fileOrBase64 }),
-      });
+      base64String = await compressAvatarImageToBase64(fileOrBase64, 300, 0.85);
     }
+
+    return fetchJson<{ success: boolean; user: User; db: DatabaseState; photoURL?: string; avatarBase64?: string; avatarVersion?: number; avatarUpdatedAt?: string }>("/api/profile/avatar", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        photoURL: base64String,
+        avatarBase64: base64String,
+        image: base64String,
+      }),
+    });
   },
 
   /**
-   * Get user avatar (Base64 string or details)
+   * Get user avatar (Base64 string or details) from public profile endpoint
    */
-  async getAvatar(userId: string): Promise<{ success: boolean; avatarBase64: string | null; avatarVersion?: number }> {
-    return fetchJson<{ success: boolean; avatarBase64: string | null; avatarVersion?: number }>(
+  async getAvatar(userId: string): Promise<{ success: boolean; avatarBase64: string | null; avatarVersion?: number; avatarUpdatedAt?: string }> {
+    return fetchJson<{ success: boolean; avatarBase64: string | null; avatarVersion?: number; avatarUpdatedAt?: string }>(
       `/api/profile/avatar/${encodeURIComponent(userId)}?format=json`
     );
   },

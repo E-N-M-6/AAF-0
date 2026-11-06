@@ -15,6 +15,7 @@ export interface User {
   sessionVersion?: number;
   totalArchivedPoints?: number;
   pushSubscriptions?: WebPushSubscription[];
+  photoURL?: string;
   hasAvatar?: boolean;
   avatarVersion?: number;
   avatarUpdatedAt?: string | number;
@@ -25,6 +26,8 @@ export interface User {
   avatarSnoozedAt?: number;
   avatarUploads?: number[];
 }
+
+export type UserProfile = User;
 
 export interface Attendance {
   meetings: number[]; // week numbers (1-12)
@@ -76,6 +79,7 @@ export interface QuizQuestion {
   questionText: string;
   options?: string[]; // array of choice options
   correctAnswer?: string; // index for choice ("0", "1", etc.), "true"/"false" for boolean, or model answer for essay grading
+  modelAnswer?: string; // stored model answer / reference answer for essay questions as admin guide
   rubricPoints?: string[]; // array of mandatory key items required for full credit
   points: number;
   isCustomPoints?: boolean; // manual point override indicator
@@ -102,10 +106,10 @@ export interface Quiz {
 export interface EssayGradeItem {
   questionId: string;
   score: number;
-  matchedRubricPoints: string[];
-  missingRubricPoints: string[];
-  gradingReasoning: string;
-  status: "auto_graded" | "admin_approved" | "admin_overridden";
+  matchedRubricPoints?: string[];
+  missingRubricPoints?: string[];
+  gradingReasoning?: string;
+  status: "auto_graded" | "admin_approved" | "admin_overridden" | "pending_manual_review";
   gradedAt: string;
 }
 
@@ -118,6 +122,7 @@ export interface QuizQuestionResult {
   missingRubricPoints?: string[];
   gradingReasoning?: string;
   autoGraded?: boolean;
+  status?: string;
 }
 
 export interface QuizViolationRecord {
@@ -127,6 +132,23 @@ export interface QuizViolationRecord {
   timestamp: string;
   leaveDuration: number;
   reason?: string;
+  type?: string;
+  details?: string;
+}
+
+export interface AdminSecurityLogItem {
+  id: string;
+  userId: string;
+  userName: string;
+  quizId: string;
+  quizTitle: string;
+  timestamp: string;
+  leaveDuration: number;
+  reason?: string;
+  type?: string;
+  details?: string;
+  violationCount?: number;
+  status?: string;
 }
 
 export interface QuizSubmission {
@@ -139,7 +161,7 @@ export interface QuizSubmission {
   totalScore: number;
   submittedAt: string;
   gradedAt?: string;
-  status: "started" | "grading" | "completed" | "VIOLATION_TERMINATED";
+  status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "VIOLATION_TERMINATED";
   isManual?: boolean;
   violationCount?: number;
   violations?: QuizViolationRecord[];
@@ -195,6 +217,7 @@ export interface ParticipantScore {
   approvedTasksCount: number;
   quizCount: number;
   rank?: number;
+  photoURL?: string;
   hasAvatar?: boolean;
   avatarVersion?: number;
   hidePhotoOnBoard?: boolean;

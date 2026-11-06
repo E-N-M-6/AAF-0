@@ -16,9 +16,18 @@ import {
   Maximize2,
   EyeOff,
   Zap,
+  WifiOff,
 } from "lucide-react";
 import { Quiz, User, DatabaseState } from "../types";
-import { ApiService } from "../services/api";
+import {
+  ApiService,
+  getQuizAnswerBackup,
+  saveQuizAnswerBackup,
+  clearQuizAnswerBackup,
+  getQuizAnswerBackupKey,
+  isNetworkOnline,
+  subscribeNetworkStatus,
+} from "../services/api";
 import { useExamSecurity } from "../hooks/useExamSecurity";
 import { triggerDazzlingCelebration } from "../lib/confetti";
 
@@ -48,21 +57,39 @@ export default function QuizRunner({
     quiz.strictImmediateKick || (proctoringMode === "STRICT" && quiz.maxLeaves === 0)
   );
 
+  // Network connection status
+  const [isOnline, setIsOnline] = useState<boolean>(() => isNetworkOnline());
+
+  useEffect(() => {
+    const unsubscribe = subscribeNetworkStatus((online) => {
+      setIsOnline(online);
+    });
+    return unsubscribe;
+  }, []);
+
   // Pre-exam rules modal state (only required if proctoring is enabled)
   const [hasAcceptedRules, setHasAcceptedRules] = useState<boolean>(!isProctoringActive);
   const [rulesCheckboxChecked, setRulesCheckboxChecked] = useState<boolean>(false);
 
-  // Quiz solving states
+  // Local storage backup key for user answers
+  const backupKey = getQuizAnswerBackupKey(quiz.id, currentUser.id);
+
+  // Quiz solving states with automatic local backup restoration
   const [answers, setAnswers] = useState<Record<string, string>>(() => {
-    if (initialAnswers) return initialAnswers;
     const init: Record<string, string> = {};
     quiz.questions.forEach((q) => {
       init[q.id] = q.type === "boolean" ? "true" : "";
     });
+    if (initialAnswers) return { ...init, ...initialAnswers };
+    const restored = getQuizAnswerBackup(quiz.id, currentUser.id);
+    if (restored) {
+      return { ...init, ...restored };
+    }
     return init;
   });
 
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [isSubmittedOptimistic, setIsSubmittedOptimistic] = useState<boolean>(false);
   const [showExitConfirm, setShowExitConfirm] = useState<boolean>(false);
   const [pasteNotice, setPasteNotice] = useState<boolean>(false);
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null);
@@ -70,6 +97,12 @@ export default function QuizRunner({
 
   const answersRef = useRef(answers);
   answersRef.current = answers;
+
+  // Continuously persist answers to localStorage while user is solving
+  useEffect(() => {
+    if (typeof window === "undefined" || isSubmitting || isSubmittedOptimistic) return;
+    saveQuizAnswerBackup(quiz.id, currentUser.id, answers);
+  }, [answers, quiz.id, currentUser.id, isSubmitting, isSubmittedOptimistic]);
 
   // Format time remaining
   const formatTime = (seconds: number) => {
@@ -91,13 +124,15 @@ export default function QuizRunner({
     isFocusLost,
     requestFullscreen,
     exitFullscreen,
+    unbindSecurity,
   } = useExamSecurity({
-    active: hasAcceptedRules && !isSubmitting && !terminatedByViolation,
+    active: hasAcceptedRules && !isSubmitting && !isSubmittedOptimistic && !terminatedByViolation,
+    isSubmitting: isSubmitting || isSubmittedOptimistic,
     proctoringMode,
     graceSeconds: isStrictImmediateKick ? 0 : (quiz.graceSeconds || 3),
     maxLeaves: isStrictImmediateKick ? 0 : (quiz.maxLeaves !== undefined ? quiz.maxLeaves : 1),
     strictImmediateKick: isStrictImmediateKick,
-    onViolation: async (count, duration, reason) => {
+    onViolation: async (count, duration, reason, details) => {
       try {
         await ApiService.logQuizViolation(
           quiz.id,
@@ -106,7 +141,9 @@ export default function QuizRunner({
           reason ||
             (proctoringMode === "STRICT"
               ? `مخالفة رقم (${count}) في الوضع الصارم - مغادرة شاشة الاختبار لمدة ${duration} ثانية`
-              : `مخالفة في وضع التنبيه - مغادرة شاشة الاختبار لمدة ${duration} ثانية`)
+              : `مخالفة في وضع التنبيه - مغادرة شاشة الاختبار لمدة ${duration} ثانية`),
+          details?.type,
+          details?.details
         );
       } catch (err) {
         console.warn("فشل تسجيل المخالفة بالخادم:", err);
@@ -127,7 +164,8 @@ export default function QuizRunner({
 
   // Handle auto-submit when violation limit is breached or strict kick triggered
   const handleViolationAutoSubmit = async (reason?: string) => {
-    if (isSubmitting || terminatedByViolation) return;
+    if (isSubmitting || isSubmittedOptimistic || terminatedByViolation) return;
+    unbindSecurity();
     setTerminatedByViolation(true);
     setIsSubmitting(true);
     await exitFullscreen().catch(() => {});
@@ -139,6 +177,7 @@ export default function QuizRunner({
         answersRef.current,
         "VIOLATION_TERMINATED"
       );
+      clearQuizAnswerBackup(quiz.id, currentUser.id);
       onUpdateState(data.db);
       onError(
         reason
@@ -157,41 +196,40 @@ export default function QuizRunner({
 
   // Regular auto-submit on timer expiration
   const handleTimerAutoSubmit = async () => {
-    if (isSubmitting || terminatedByViolation) return;
+    if (isSubmitting || isSubmittedOptimistic || terminatedByViolation) return;
+    unbindSecurity();
     setIsSubmitting(true);
+    setIsSubmittedOptimistic(true);
+    saveQuizAnswerBackup(quiz.id, currentUser.id, answersRef.current);
     await exitFullscreen().catch(() => {});
-    onError("⏱️ انتهى الوقت المحدد للاختبار! جاري تسليم إجاباتك الحالية تلقائياً...");
 
-    try {
-      const data = await ApiService.submitQuiz(
-        quiz.id,
-        currentUser.id,
-        answersRef.current
-      );
-      onUpdateState(data.db);
-      const myScore = data.db.quizSubmissions?.find(
-        (s) => s.quizId === quiz.id && s.userId === currentUser.id
-      );
-      if (myScore) {
-        onSuccess(
-          `⏱️ انتهى وقت الاختبار! تم حفظ إجاباتك وتسليم الكويز بنجاح. حصلت على: ${myScore.totalScore} نقطة من ${quiz.points}!`
+    ApiService.submitQuiz(quiz.id, currentUser.id, answersRef.current)
+      .then((data) => {
+        clearQuizAnswerBackup(quiz.id, currentUser.id);
+        onUpdateState(data.db);
+        const myScore = data.db.quizSubmissions?.find(
+          (s) => s.quizId === quiz.id && s.userId === currentUser.id
         );
-      } else {
-        onSuccess("⏱️ انتهى وقت الاختبار! تم تسليم إجاباتك تلقائياً بنجاح.");
-      }
-      onClose();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "حدث خطأ أثناء التسليم التلقائي";
-      onError(msg);
-      onClose();
-    } finally {
-      setIsSubmitting(false);
-    }
+        if (myScore) {
+          onSuccess(
+            `⏱️ انتهى وقت الاختبار! تم حفظ إجاباتك ورصد نتيجتك: ${myScore.totalScore} نقطة من ${quiz.points}!`
+          );
+        } else {
+          onSuccess("⏱️ انتهى وقت الاختبار! تم تسليم إجاباتك بنجاح.");
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : "حدث خطأ أثناء التسليم التلقائي";
+        onError(`تنبيه: تم حفظ إجاباتك محلياً، لكن تعذر التأكيد الفوري: ${msg}`);
+      })
+      .finally(() => {
+        setIsSubmitting(false);
+      });
   };
 
   // Timer countdown
   useEffect(() => {
-    if (!hasAcceptedRules || !quiz.timeLimit || quiz.timeLimit <= 0) {
+    if (!hasAcceptedRules || isSubmittedOptimistic || !quiz.timeLimit || quiz.timeLimit <= 0) {
       setRemainingSeconds(null);
       return;
     }
@@ -212,12 +250,12 @@ export default function QuizRunner({
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [hasAcceptedRules, quiz.timeLimit]);
+  }, [hasAcceptedRules, isSubmittedOptimistic, quiz.timeLimit]);
 
-  // Submit action by student
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (isSubmitting || terminatedByViolation) return;
+  // Submit action by student with optimistic UI transition and background network submission
+  const handleSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (isSubmitting || isSubmittedOptimistic || terminatedByViolation) return;
 
     // Check if any unanswered question
     const unanswered = quiz.questions.some((q) => !answers[q.id]?.trim());
@@ -226,37 +264,55 @@ export default function QuizRunner({
       return;
     }
 
+    // 1. Instantly unbind security sensors & short-circuit proctoring event listeners
+    unbindSecurity();
+
+    // 2. Immediately set submitting & optimistic state flags
     setIsSubmitting(true);
+    setIsSubmittedOptimistic(true);
+
+    // 3. Persist local answer backup in localStorage before initiating submit
+    saveQuizAnswerBackup(quiz.id, currentUser.id, answersRef.current);
+
+    // 4. Safely exit fullscreen without triggering false security warnings
     await exitFullscreen().catch(() => {});
 
-    try {
-      const data = await ApiService.submitQuiz(
-        quiz.id,
-        currentUser.id,
-        answers
-      );
-      onUpdateState(data.db);
+    // 5. Trigger celebration animation
+    triggerDazzlingCelebration();
 
-      const myScore = data.db.quizSubmissions?.find(
-        (s) => s.quizId === quiz.id && s.userId === currentUser.id
-      );
+    // 6. Execute API network request asynchronously in the background
+    ApiService.submitQuiz(quiz.id, currentUser.id, answersRef.current)
+      .then((data) => {
+        // Clear local answer backup ONLY after HTTP 200 response confirmation
+        clearQuizAnswerBackup(quiz.id, currentUser.id);
 
-      triggerDazzlingCelebration();
+        onUpdateState(data.db);
 
-      if (myScore) {
-        onSuccess(
-          `تم تسليم الكويز بنجاح وتقييمه تلقائياً! حصلت على: ${myScore.totalScore} نقطة من ${quiz.points}! 🎉`
+        const myScore = data.db.quizSubmissions?.find(
+          (s) => s.quizId === quiz.id && s.userId === currentUser.id
         );
-      } else {
-        onSuccess("تم تسليم الكويز بنجاح! سيتم تقييمه وعرض نتيجتك فوراً. 🎉");
-      }
-      onClose();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "حدث خطأ ما أثناء تسليم الكويز";
-      onError(msg);
-    } finally {
-      setIsSubmitting(false);
-    }
+
+        if (myScore) {
+          if (myScore.status === "pending_manual_review") {
+            onSuccess(
+              `تم تسليم الكويز بنجاح! أسئلة الاختيارات صُححت فوراً (${myScore.totalScore} نقطة)، والأسئلة المقالية بانتظار مراجعة المشرف. 🎉`
+            );
+          } else {
+            onSuccess(
+              `تم تسليم الكويز وتقييمه بنجاح! حصلت على: ${myScore.totalScore} نقطة من ${quiz.points}! 🎉`
+            );
+          }
+        } else {
+          onSuccess("تم تسليم الكويز بنجاح! 🎉");
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : "حدث خطأ أثناء الاتصال بالخادم";
+        onError(`ملاحظة: إجاباتك محفوظة بأمان محلياً. تعذر التأكيد فوراً: ${msg}`);
+      })
+      .finally(() => {
+        setIsSubmitting(false);
+      });
   };
 
   const handleRequestExit = () => {
@@ -404,8 +460,52 @@ export default function QuizRunner({
         </motion.div>
       )}
 
-      {/* 2. ACTIVE QUIZ RUNNER INTERFACE */}
-      {hasAcceptedRules && (
+      {/* 2. OPTIMISTIC CONFIRMATION VIEW (shows immediately upon submit) */}
+      {hasAcceptedRules && isSubmittedOptimistic && (
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0, y: 15 }}
+          animate={{ scale: 1, opacity: 1, y: 0 }}
+          className="relative w-full max-w-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-3xl shadow-2xl p-6 text-slate-900 dark:text-slate-100 my-auto text-center space-y-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="w-16 h-16 rounded-full bg-emerald-100 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mx-auto text-3xl shadow-md animate-bounce">
+            <CheckCircle2 className="w-10 h-10" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="text-xl font-black text-emerald-700 dark:text-emerald-400">
+              تم تسليم الامتحان بنجاح! 🎉
+            </h3>
+            <p className="text-xs font-bold text-natural-accent">
+              اختبار: {quiz.title} ({quiz.points} نقطة)
+            </p>
+          </div>
+          <div className="p-4 bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 rounded-2xl text-xs font-semibold text-emerald-900 dark:text-emerald-200 leading-relaxed text-right space-y-2">
+            <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-extrabold">
+              <ShieldCheck className="w-4 h-4 text-emerald-600" />
+              <span>تم تسجيل إجاباتك وإلغاء قيود المراقبة بنجاح.</span>
+            </div>
+            <p className="text-[11px] text-emerald-700 dark:text-emerald-300 leading-relaxed">
+              تم إرسال جميع إجاباتك بنجاح للخادم لتقييمها ورصد الدرجة في لوحة الصدارة. يمكنك مغادرة هذه الصفحة بحرية ودون أي مخاطرة.
+            </p>
+          </div>
+          {isSubmitting && (
+            <div className="flex items-center justify-center gap-2 text-xs font-bold text-slate-500 animate-pulse pt-1">
+              <Clock className="w-4 h-4 animate-spin" />
+              <span>جاري المزامنة في الخلفية...</span>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full bg-natural-green hover:bg-natural-olive text-white font-extrabold py-3.5 rounded-xl text-xs transition-all shadow-md cursor-pointer mt-2"
+          >
+            العودة للوحة المشارك 🏠
+          </button>
+        </motion.div>
+      )}
+
+      {/* 3. ACTIVE QUIZ RUNNER INTERFACE */}
+      {hasAcceptedRules && !isSubmittedOptimistic && (
         <motion.div
           initial={{ scale: 0.93, y: 25, opacity: 0 }}
           animate={{ scale: 1, y: 0, opacity: 1 }}
@@ -475,6 +575,13 @@ export default function QuizRunner({
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-800 flex items-center gap-1">
                     <Sun className="w-3 h-3 text-amber-500 animate-spin-slow" />
                     الشاشة مضاءة للقراءة
+                  </span>
+                )}
+
+                {!isOnline && (
+                  <span className="text-[10px] font-black px-2.5 py-0.5 rounded-full bg-rose-100 text-rose-800 border border-rose-300 dark:bg-rose-950/90 dark:text-rose-200 dark:border-rose-700 flex items-center gap-1 animate-pulse shadow-xs">
+                    <WifiOff className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
+                    معطل مؤقتاً بسبب انقطاع الإنترنت 📡
                   </span>
                 )}
               </div>

@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from "react";
 import { authenticatedFetch } from "../services/api";
 
-interface AvatarProps {
-  userId: string;
+export interface AvatarProps {
+  src?: string | null;
+  name?: string;
+  userId?: string;
   userName?: string;
-  size?: 96 | 512;
+  size?: 96 | 512 | number;
   avatarVersion?: number;
   hasAvatar?: boolean;
   className?: string;
@@ -12,12 +14,13 @@ interface AvatarProps {
   alt?: string;
   showBadge?: boolean;
   badgeContent?: React.ReactNode;
+  onClick?: () => void;
 }
 
-// In-memory cache to store blob URLs keyed by userId, size, and version
-const avatarBlobCache = new Map<string, string>();
+// In-memory cache for fetched base64 avatars when src is not directly passed
+const avatarMemoryBase64Cache = new Map<string, string>();
 
-// Helper to generate deterministic gradient colors from userId
+// Helper to generate deterministic gradient colors from userId or name
 const AVATAR_GRADIENTS = [
   "from-[#c51f26] to-[#881337]",
   "from-[#1b4393] to-[#1e3a8a]",
@@ -29,28 +32,70 @@ const AVATAR_GRADIENTS = [
   "from-amber-500 to-yellow-700",
 ];
 
-function getGradientForUser(userId: string): string {
+export function getGradientForUser(key: string): string {
   let hash = 0;
-  for (let i = 0; i < userId.length; i++) {
-    hash = userId.charCodeAt(i) + ((hash << 5) - hash);
+  for (let i = 0; i < key.length; i++) {
+    hash = key.charCodeAt(i) + ((hash << 5) - hash);
   }
   const index = Math.abs(hash) % AVATAR_GRADIENTS.length;
   return AVATAR_GRADIENTS[index];
 }
 
-function getInitials(name?: string, userId?: string): string {
+export function getInitials(name?: string, userId?: string): string {
   if (name && name.trim()) {
-    const parts = name.trim().split(/\s+/);
+    const parts = name.trim().split(/\s+/).filter(Boolean);
     if (parts.length >= 2 && parts[0] && parts[1]) {
-      return (parts[0][0] + parts[1][0]).toUpperCase();
+      if (parts[0] === "أبرام" && parts[1] === "ناروز") {
+        return "أ ب";
+      }
+      return `${parts[0][0]} ${parts[1][0]}`;
     }
-    return name.trim().slice(0, 2).toUpperCase();
+    if (parts[0] && parts[0].length >= 2) {
+      return `${parts[0][0]} ${parts[0][1]}`;
+    }
+    return parts[0];
   }
   return (userId || "U").slice(0, 2).toUpperCase();
 }
 
+/**
+ * Inspects incoming photoURL:
+ * - Explicitly ALLOW relative paths (e.g., /api/profile/avatar/:userId or /assets/...), data:image/ URIs, and valid external https:// URLs.
+ * - Automatically treat any string starting with blob:, http://localhost, https://localhost, http://127.0.0.1, or file:// as invalid,
+ *   bypassing broken <img> renders and falling back cleanly to user initials.
+ */
+export function isInvalidAvatarSrc(src?: string | null): boolean {
+  if (!src || typeof src !== "string") return true;
+  const trimmed = src.trim();
+  if (!trimmed) return true;
+
+  // Explicit blacklist: blob:, localhost, file://
+  if (
+    trimmed.startsWith("blob:") ||
+    trimmed.startsWith("http://localhost") ||
+    trimmed.startsWith("https://localhost") ||
+    trimmed.startsWith("http://127.0.0.1") ||
+    trimmed.startsWith("file://")
+  ) {
+    return true;
+  }
+
+  // Accept ONLY strings starting explicitly with relative paths (e.g. /api/profile/avatar/ or /assets/),
+  // data:image/ URIs, or valid external https:// URLs
+  const isValid =
+    trimmed.startsWith("/api/profile/avatar/") ||
+    trimmed.startsWith("/assets/") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("data:image/") ||
+    trimmed.startsWith("https://");
+
+  return !isValid;
+}
+
 export default function Avatar({
-  userId,
+  src,
+  name,
+  userId = "",
   userName,
   size = 96,
   avatarVersion,
@@ -60,128 +105,121 @@ export default function Avatar({
   alt,
   showBadge,
   badgeContent,
+  onClick,
 }: AvatarProps) {
-  const [imgUrl, setImgUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState<boolean>(Boolean(hasAvatar));
-  const [hasError, setHasError] = useState<boolean>(!hasAvatar);
+  const displayName = name || userName || "";
+  const keyForGradient = userId || displayName || "U";
+  const [loadError, setLoadError] = useState<boolean>(false);
 
-  const cacheKey = `${userId}_${size}_${avatarVersion || 0}`;
+  // Check incoming direct src
+  const directSrc = typeof src === "string" ? src.trim() : null;
+  const isDirectInvalid = isInvalidAvatarSrc(directSrc);
+  const isDirectDataUrl = Boolean(directSrc && !isDirectInvalid && directSrc.startsWith("data:image/"));
+  const isDirectRemoteOrRelativeUrl = Boolean(
+    directSrc &&
+      !isDirectInvalid &&
+      (directSrc.startsWith("https://") || directSrc.startsWith("/"))
+  );
 
+  // Fallback state if src was not provided but userId is present
+  const [fallbackBase64, setFallbackBase64] = useState<string | null>(() => {
+    if (!directSrc && userId && avatarMemoryBase64Cache.has(userId)) {
+      const cached = avatarMemoryBase64Cache.get(userId) || null;
+      if (cached && !isInvalidAvatarSrc(cached)) {
+        return cached;
+      }
+    }
+    return null;
+  });
+
+  // Reset load error state when src, fallbackBase64, or userId changes
   useEffect(() => {
-    if (!hasAvatar || !userId) {
-      setImgUrl(null);
-      setLoading(false);
-      setHasError(true);
-      return;
-    }
+    setLoadError(false);
+  }, [src, fallbackBase64, userId, avatarVersion]);
 
-    // Check in-memory cache first
-    if (avatarBlobCache.has(cacheKey)) {
-      setImgUrl(avatarBlobCache.get(cacheKey)!);
-      setLoading(false);
-      setHasError(false);
-      return;
-    }
+  // Background fallback ONLY if directSrc is missing or invalid, hasAvatar is true, and userId is present
+  useEffect(() => {
+    if ((directSrc && !isDirectInvalid) || !hasAvatar || !userId || fallbackBase64) return;
 
     let isMounted = true;
-    setLoading(true);
-    setHasError(false);
-
     const fetchAvatar = async () => {
       try {
-        const url = `/api/profile/avatar/${encodeURIComponent(userId)}?size=${size}&v=${avatarVersion || 0}`;
-        const response = await authenticatedFetch(url);
-
-        if (!response.ok) {
-          if (isMounted) {
-            setHasError(true);
-            setLoading(false);
-          }
-          return;
+        const res = await authenticatedFetch(
+          `/api/profile/avatar/${encodeURIComponent(userId)}?format=json&v=${avatarVersion || 0}`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (
+          isMounted &&
+          data &&
+          typeof data.avatarBase64 === "string" &&
+          !isInvalidAvatarSrc(data.avatarBase64) &&
+          data.avatarBase64.startsWith("data:image/")
+        ) {
+          avatarMemoryBase64Cache.set(userId, data.avatarBase64);
+          setFallbackBase64(data.avatarBase64);
         }
-
-        const contentType = response.headers.get("content-type") || "";
-        let finalUrl = "";
-
-        if (contentType.includes("application/json")) {
-          const data = await response.json();
-          if (data && data.avatarBase64) {
-            finalUrl = data.avatarBase64;
-          } else {
-            if (isMounted) {
-              setHasError(true);
-              setLoading(false);
-            }
-            return;
-          }
-        } else {
-          const blob = await response.blob();
-          if (blob.size === 0) {
-            if (isMounted) {
-              setHasError(true);
-              setLoading(false);
-            }
-            return;
-          }
-          finalUrl = URL.createObjectURL(blob);
-        }
-
-        avatarBlobCache.set(cacheKey, finalUrl);
-
-        if (isMounted) {
-          setImgUrl(finalUrl);
-          setLoading(false);
-          setHasError(false);
-        }
-      } catch (err) {
-        if (isMounted) {
-          setHasError(true);
-          setLoading(false);
-        }
+      } catch {
+        // Silently keep initials fallback on network error
       }
     };
 
     fetchAvatar();
-
     return () => {
       isMounted = false;
     };
-  }, [userId, size, avatarVersion, hasAvatar, cacheKey]);
+  }, [directSrc, isDirectInvalid, hasAvatar, userId, avatarVersion, fallbackBase64]);
 
-  const gradient = getGradientForUser(userId);
-  const initials = getInitials(userName, userId);
+  // Determine final image URL to render:
+  // 1. Direct valid src (e.g., relative /api/profile/avatar/:userId, data:image/, https://)
+  // 2. Asynchronously resolved fallback Base64
+  // 3. Fallback to public binary avatar endpoint if hasAvatar is true and userId is present
+  const finalSrc = isDirectDataUrl || isDirectRemoteOrRelativeUrl
+    ? directSrc
+    : (!isInvalidAvatarSrc(fallbackBase64) ? fallbackBase64 : null) ||
+      (hasAvatar && userId && !loadError
+        ? `/api/profile/avatar/${encodeURIComponent(userId)}?v=${avatarVersion || 0}`
+        : null);
 
-  const sizeClasses = size === 512
-    ? "w-24 h-24 sm:w-28 sm:h-28 md:w-32 md:h-32 text-2xl sm:text-3xl font-black"
-    : "w-10 h-10 sm:w-11 sm:h-11 md:w-12 md:h-12 text-xs sm:text-sm font-black";
+  const shouldRenderImage = !loadError && hasAvatar && Boolean(finalSrc) && !isInvalidAvatarSrc(finalSrc);
+
+  const gradient = getGradientForUser(keyForGradient);
+  const initials = getInitials(displayName, keyForGradient);
+
+  const sizeClasses =
+    size === 512
+      ? "w-24 h-24 sm:w-28 sm:h-28 md:w-32 md:h-32 text-2xl sm:text-3xl font-black"
+      : "w-10 h-10 sm:w-11 sm:h-11 md:w-12 md:h-12 text-xs sm:text-sm font-black";
 
   return (
-    <div className={`relative inline-block shrink-0 ${className}`}>
+    <div
+      className={`relative inline-block shrink-0 ${className}`}
+      onClick={onClick}
+    >
       {/* Container with optional ring */}
       <div
         className={`relative rounded-full overflow-hidden flex items-center justify-center transition-all ${sizeClasses} ${
           ringColor ? ringColor : "border-2 border-slate-200 dark:border-slate-700 shadow-sm"
         }`}
       >
-        {!hasError && imgUrl ? (
+        {shouldRenderImage && finalSrc ? (
           <img
-            src={imgUrl}
-            alt={alt || userName || "المستخدم"}
-            loading="lazy"
+            src={finalSrc}
+            alt={alt || displayName || "المستخدم"}
+            loading="eager"
             decoding="async"
-            className="w-full h-full object-cover rounded-full"
-            onError={() => setHasError(true)}
+            className="w-full h-full object-cover rounded-full transition-opacity duration-200"
+            onError={() => {
+              setLoadError(true);
+            }}
           />
         ) : (
-          /* Fallback Colored Initials */
+          /* Fallback Stylized Colored Circle with User Initials */
           <div
-            className={`w-full h-full bg-gradient-to-br ${gradient} text-white flex items-center justify-center font-black select-none tracking-wider`}
+            className={`w-full h-full bg-gradient-to-br ${gradient} text-white flex items-center justify-center font-black select-none tracking-wider shadow-inner transition-opacity duration-200`}
+            style={{ direction: "rtl" }}
           >
-            {loading ? (
-              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <span>{initials}</span>
-            )}
+            <span className="drop-shadow-sm leading-none">{initials}</span>
           </div>
         )}
       </div>

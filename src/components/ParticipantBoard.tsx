@@ -521,6 +521,8 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
             <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
               <div className="relative group shrink-0">
                 <Avatar
+                  src={currentUser.photoURL}
+                  name={currentUser.name}
                   userId={currentUser.id}
                   userName={currentUser.name}
                   size={512}

@@ -2,7 +2,8 @@ import React, { useState, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Camera, Image as ImageIcon, Upload, X, Sparkles, AlertCircle, CheckCircle2 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { ApiService } from "../services/api";
+import { ApiService, compressAvatarImageToBase64 } from "../services/api";
+import { isInvalidAvatarSrc } from "./Avatar";
 import { User, DatabaseState } from "../types";
 
 interface AvatarUploadModalProps {
@@ -36,65 +37,6 @@ export default function AvatarUploadModal({
 
   if (!isOpen) return null;
 
-  const processImageFile = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const dataUrl = e.target?.result as string;
-        if (!dataUrl) {
-          reject(new Error("فشل قراءة الملف"));
-          return;
-        }
-
-        const img = new Image();
-        img.onload = () => {
-          let width = img.width;
-          let height = img.height;
-          const maxDim = 1024;
-          const limitDim = 1600;
-
-          if (width > limitDim || height > limitDim || width > maxDim || height > maxDim) {
-            if (width > height) {
-              height = Math.round((height * maxDim) / width);
-              width = maxDim;
-            } else {
-              width = Math.round((width * maxDim) / height);
-              height = maxDim;
-            }
-          }
-
-          const canvas = document.createElement("canvas");
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext("2d");
-          if (!ctx) {
-            reject(new Error("تعذر إنشاء سياق الرسم"));
-            return;
-          }
-
-          ctx.drawImage(img, 0, 0, width, height);
-          let outputDataUrl = canvas.toDataURL("image/webp", 0.9);
-          if (!outputDataUrl.startsWith("data:image/webp")) {
-            outputDataUrl = canvas.toDataURL("image/jpeg", 0.9);
-          }
-          resolve(outputDataUrl);
-        };
-
-        img.onerror = () => {
-          reject(new Error("تعذر قراءة الصورة"));
-        };
-
-        img.src = dataUrl;
-      };
-
-      reader.onerror = () => {
-        reject(new Error("تعذر قراءة ملف القراءة"));
-      };
-
-      reader.readAsDataURL(file);
-    });
-  };
-
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -105,10 +47,12 @@ export default function AvatarUploadModal({
     }
 
     try {
-      const processedDataUrl = await processImageFile(file);
-      setPreviewUrl(processedDataUrl);
+      // 1. Draw and resize the image to exactly 300x300 pixels on canvas
+      // 2. Export canvas as a WebP Base64 Data URL string (0.85 quality)
+      const compressedWebP = await compressAvatarImageToBase64(file, 300, 0.85);
+      setPreviewUrl(compressedWebP);
       setSelectedFile(null);
-    } catch (err) {
+    } catch {
       setError("تعذر قراءة هذه الصورة، يرجى اختيار صورة أخرى أو التقاط صورة جديدة");
     }
   };
@@ -121,7 +65,7 @@ export default function AvatarUploadModal({
 
     setIsUploading(true);
     try {
-      const payload = selectedFile || previewUrl!;
+      const payload = previewUrl || selectedFile!;
       const res = await ApiService.uploadAvatar(payload);
 
       if (res.success) {
@@ -196,9 +140,9 @@ export default function AvatarUploadModal({
           {/* Circular Image Preview / Picker */}
           <div className="my-6 flex flex-col items-center justify-center space-y-4">
             <div className="relative w-32 h-32 rounded-full border-4 border-amber-400 dark:border-amber-500/80 shadow-lg overflow-hidden bg-slate-100 dark:bg-slate-800 flex items-center justify-center group">
-              {previewUrl ? (
+              {previewUrl || (currentUser.photoURL && !isInvalidAvatarSrc(currentUser.photoURL)) ? (
                 <img
-                  src={previewUrl}
+                  src={previewUrl || currentUser.photoURL}
                   alt="معاينة الصورة"
                   className="w-full h-full object-cover"
                 />

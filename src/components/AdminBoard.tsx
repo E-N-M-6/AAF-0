@@ -687,7 +687,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
 
   // 8. Quiz Helper Handlers & Default Scoring
   const handleDefaultMcqPointsChange = (val: number) => {
-    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    const pts = Math.max(0.1, isNaN(val) ? 0.5 : val);
     setDefaultMcqPoints(pts);
     setNewQuizQuestions(prev => prev.map(q => {
       if (q.type === "choice" && !q.isCustomPoints) {
@@ -698,7 +698,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   };
 
   const handleDefaultTrueFalsePointsChange = (val: number) => {
-    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    const pts = Math.max(0.1, isNaN(val) ? 0.5 : val);
     setDefaultTrueFalsePoints(pts);
     setNewQuizQuestions(prev => prev.map(q => {
       if (q.type === "boolean" && !q.isCustomPoints) {
@@ -709,7 +709,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   };
 
   const handleDefaultEssayPointsChange = (val: number) => {
-    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    const pts = Math.max(0.1, isNaN(val) ? 0.5 : val);
     setDefaultEssayPoints(pts);
     setNewQuizQuestions(prev => prev.map(q => {
       if (q.type === "essay" && !q.isCustomPoints) {
@@ -720,7 +720,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   };
 
   const handleDefaultFillBlankPointsChange = (val: number) => {
-    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    const pts = Math.max(0.1, isNaN(val) ? 0.5 : val);
     setDefaultFillBlankPoints(pts);
     setNewQuizQuestions(prev => prev.map(q => {
       if (q.type === "fill_in_the_blank" && !q.isCustomPoints) {
@@ -731,7 +731,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   };
 
   const handleDefaultQuotePointsChange = (val: number) => {
-    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    const pts = Math.max(0.1, isNaN(val) ? 0.5 : val);
     setDefaultQuotePoints(pts);
     setNewQuizQuestions(prev => prev.map(q => {
       if (q.type === "quote" && !q.isCustomPoints) {
@@ -844,7 +844,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
     }
 
     setIsCreatingQuiz(true);
-    const totalPoints = newQuizQuestions.reduce((sum, q) => sum + parseInt(q.points || 0, 10), 0);
+    const totalPoints = Math.round(newQuizQuestions.reduce((sum, q) => sum + (parseFloat(q.points) || 0), 0) * 100) / 100;
 
     try {
       const data = await ApiService.createQuiz(
@@ -2015,9 +2015,10 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         <div className="flex items-center gap-1.5">
                           <input
                             type="number"
-                            min="1"
+                            min="0.1"
+                            step="0.5"
                             value={defaultMcqPoints}
-                            onChange={(e) => handleDefaultMcqPointsChange(parseInt(e.target.value, 10))}
+                            onChange={(e) => handleDefaultMcqPointsChange(parseFloat(e.target.value))}
                             className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
@@ -2032,9 +2033,10 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         <div className="flex items-center gap-1.5">
                           <input
                             type="number"
-                            min="1"
+                            min="0.1"
+                            step="0.5"
                             value={defaultTrueFalsePoints}
-                            onChange={(e) => handleDefaultTrueFalsePointsChange(parseInt(e.target.value, 10))}
+                            onChange={(e) => handleDefaultTrueFalsePointsChange(parseFloat(e.target.value))}
                             className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
@@ -2049,9 +2051,10 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         <div className="flex items-center gap-1.5">
                           <input
                             type="number"
-                            min="1"
+                            min="0.1"
+                            step="0.5"
                             value={defaultFillBlankPoints}
-                            onChange={(e) => handleDefaultFillBlankPointsChange(parseInt(e.target.value, 10))}
+                            onChange={(e) => handleDefaultFillBlankPointsChange(parseFloat(e.target.value))}
                             className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
@@ -2066,9 +2069,10 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         <div className="flex items-center gap-1.5">
                           <input
                             type="number"
-                            min="1"
+                            min="0.1"
+                            step="0.5"
                             value={defaultQuotePoints}
-                            onChange={(e) => handleDefaultQuotePointsChange(parseInt(e.target.value, 10))}
+                            onChange={(e) => handleDefaultQuotePointsChange(parseFloat(e.target.value))}
                             className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
@@ -2083,9 +2087,10 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         <div className="flex items-center gap-1.5">
                           <input
                             type="number"
-                            min="1"
+                            min="0.1"
+                            step="0.5"
                             value={defaultEssayPoints}
-                            onChange={(e) => handleDefaultEssayPointsChange(parseInt(e.target.value, 10))}
+                            onChange={(e) => handleDefaultEssayPointsChange(parseFloat(e.target.value))}
                             className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
@@ -2327,10 +2332,11 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                                 <input
                                   type="number"
                                   required
-                                  min={1}
+                                  min={0.1}
+                                  step={0.5}
                                   value={q.points}
                                   onChange={(e) => {
-                                    const val = parseInt(e.target.value, 10) || 1;
+                                    const val = parseFloat(e.target.value) || 0.5;
                                     handleUpdateQuestion(qIdx, "points", val);
                                     handleUpdateQuestion(qIdx, "isCustomPoints", true);
                                   }}
@@ -2816,11 +2822,12 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                 <label className="block text-xs font-bold text-natural-green mb-1.5">النقاط المقدرة للتنفيذ:</label>
                 <input
                   type="number"
-                  min={5}
+                  min={1}
                   max={200}
+                  step={0.5}
                   required
                   value={taskPoints}
-                  onChange={(e) => setTaskPoints(parseInt(e.target.value, 10))}
+                  onChange={(e) => setTaskPoints(parseFloat(e.target.value) || 0)}
                   className="w-full text-xs p-2.5 rounded-xl border border-natural-border bg-natural-cream outline-hidden focus:border-natural-green focus:bg-white transition-all font-semibold text-natural-text"
                 />
               </div>
@@ -2899,10 +2906,11 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                     <input
                       type="number"
                       required
-                      min={1}
+                      min={0.5}
                       max={100}
+                      step={0.5}
                       value={bonusPoints}
-                      onChange={(e) => setBonusPoints(parseInt(e.target.value, 10))}
+                      onChange={(e) => setBonusPoints(parseFloat(e.target.value) || 0)}
                       className="w-full text-xs p-2.5 rounded-xl border border-natural-border bg-white outline-hidden focus:border-natural-green font-bold text-natural-text"
                     />
                   </div>
@@ -4138,6 +4146,8 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
           defaultMcqPoints={defaultMcqPoints}
           defaultTrueFalsePoints={defaultTrueFalsePoints}
           defaultEssayPoints={defaultEssayPoints}
+          defaultFillBlankPoints={defaultFillBlankPoints}
+          defaultQuotePoints={defaultQuotePoints}
         />,
         document.body
       )}

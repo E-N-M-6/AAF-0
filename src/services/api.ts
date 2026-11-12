@@ -240,13 +240,17 @@ export async function authenticatedFetch(
 ): Promise<Response> {
   const headers = getAuthHeaders(options?.headers);
   return fetch(url, {
+    cache: options?.cache ?? "no-store",
     ...options,
     headers,
   });
 }
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await authenticatedFetch(url, options);
+  const response = await authenticatedFetch(url, {
+    cache: "no-store",
+    ...options,
+  });
 
   if (response.status === 401) {
     clearSession();
@@ -386,8 +390,61 @@ export const ApiService = {
    * Fetch full state with optional force refresh to bypass server-side caching/cooldown and pull from Firestore
    */
   async getState(forceRefresh?: boolean): Promise<DatabaseState> {
-    const url = forceRefresh ? "/api/state?force_refresh=true" : "/api/state";
-    return fetchJson<DatabaseState>(url);
+    const timestamp = Date.now();
+    const params = new URLSearchParams();
+    if (forceRefresh) {
+      params.set("force_refresh", "true");
+    }
+    params.set("_t", timestamp.toString());
+    const url = `/api/state?${params.toString()}`;
+    return fetchJson<DatabaseState>(url, { cache: "no-store" });
+  },
+
+  /**
+   * Core data-fetching method: alias for getState with strict cache-busting
+   */
+  async getAppState(forceRefresh?: boolean): Promise<DatabaseState> {
+    return this.getState(forceRefresh);
+  },
+
+  /**
+   * Fetch leaderboard data with strict cache-busting timestamp
+   */
+  async getLeaderboard(forceRefresh?: boolean): Promise<any> {
+    const timestamp = Date.now();
+    const params = new URLSearchParams();
+    if (forceRefresh) {
+      params.set("force_refresh", "true");
+    }
+    params.set("_t", timestamp.toString());
+    const url = `/api/leaderboard?${params.toString()}`;
+    return fetchJson(url, { cache: "no-store" });
+  },
+
+  /**
+   * Fetch dynamic quizzes data with strict cache-busting timestamp
+   */
+  async getQuizzes(forceRefresh = true): Promise<{ success: boolean; quizzes: any[]; quizSubmissions?: any[] }> {
+    const timestamp = Date.now();
+    const url = `/api/quizzes?_t=${timestamp}`;
+    return fetchJson<{ success: boolean; quizzes: any[]; quizSubmissions?: any[] }>(url, { cache: "no-store" });
+  },
+
+  /**
+   * Refresh all dynamic admin data (live state, quiz submissions, security audit logs)
+   * with cache-busting timestamp query parameter to bypass stale HTTP and proxy caching
+   */
+  async refreshAdminData(): Promise<{ db: DatabaseState; submissions: any[]; securityLogs?: any[] }> {
+    const [db, subsRes, logsRes] = await Promise.all([
+      this.getState(true),
+      this.getAdminSubmissions(true),
+      this.getSecurityLogs(true).catch(() => ({ success: false, logs: [], flaggedSubmissions: [], summary: {} })),
+    ]);
+    return {
+      db,
+      submissions: subsRes.submissions || subsRes.quizSubmissions || [],
+      securityLogs: logsRes.logs || [],
+    };
   },
 
   /**
@@ -895,8 +952,10 @@ export const ApiService = {
   /**
    * Expose Admin Security Audit Logs for flagged student submissions and violations
    */
-  async getSecurityLogs(): Promise<{ success: boolean; logs: any[]; flaggedSubmissions: any[]; summary: any }> {
-    return fetchJson<{ success: boolean; logs: any[]; flaggedSubmissions: any[]; summary: any }>("/api/admin/security-logs");
+  async getSecurityLogs(forceRefresh = true): Promise<{ success: boolean; logs: any[]; flaggedSubmissions: any[]; summary: any }> {
+    const timestamp = Date.now();
+    const url = `/api/admin/security-logs?_t=${timestamp}`;
+    return fetchJson<{ success: boolean; logs: any[]; flaggedSubmissions: any[]; summary: any }>(url, { cache: "no-store" });
   },
 
   /**
@@ -928,8 +987,10 @@ export const ApiService = {
   /**
    * Fetch quiz submissions directly with cold-start resilience (Admin only)
    */
-  async getAdminSubmissions(): Promise<{ success: boolean; submissions: any[]; quizSubmissions: any[]; count?: number }> {
-    return fetchJson<{ success: boolean; submissions: any[]; quizSubmissions: any[]; count?: number }>("/api/admin/submissions");
+  async getAdminSubmissions(forceRefresh = true): Promise<{ success: boolean; submissions: any[]; quizSubmissions: any[]; count?: number }> {
+    const timestamp = Date.now();
+    const url = `/api/admin/submissions?_t=${timestamp}`;
+    return fetchJson<{ success: boolean; submissions: any[]; quizSubmissions: any[]; count?: number }>(url, { cache: "no-store" });
   },
 
   /**
@@ -1056,3 +1117,8 @@ export const ApiService = {
     });
   },
 };
+
+export const getAppState = (forceRefresh?: boolean) => ApiService.getAppState(forceRefresh);
+export const getLeaderboard = (forceRefresh?: boolean) => ApiService.getLeaderboard(forceRefresh);
+export const refreshAdminData = () => ApiService.refreshAdminData();
+

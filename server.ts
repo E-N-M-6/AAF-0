@@ -591,6 +591,14 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ limit: "10mb", extended: true }));
 
+// Strict no-cache middleware for dynamic real-time data endpoints
+const noCacheMiddleware: express.Handler = (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+};
+
 // Serve the uploaded logo directly to avoid bundler resolution issues
 app.get("/assets/logo.jpg", (req, res) => {
   const srcPath = path.join(process.cwd(), "src", "assets", "logo.jpg");
@@ -1704,16 +1712,13 @@ async function getExportData(): Promise<DatabaseSchema> {
 // API Endpoints
 
 // Export Full Backup JSON (Admin Only, Streaming, Read-Only, Passcode-filtered)
-app.get("/api/admin/export", requireAdmin, async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.get("/api/admin/export", requireAdmin, noCacheMiddleware, async (req: express.Request, res: express.Response, next: express.NextFunction) => {
   try {
     const today = new Date().toISOString().split("T")[0];
     const filename = `marathon-backup-${today}.json`;
 
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
 
     const data = await getExportData();
 
@@ -1837,7 +1842,7 @@ app.get("/api/admin/export", requireAdmin, async (req: express.Request, res: exp
 });
 
 // Resilient Submissions Fetch Endpoint (Admin Only, Cold-Start Guarded with Retry)
-app.get("/api/admin/submissions", requireAdmin, async (req: express.Request, res: express.Response) => {
+app.get("/api/admin/submissions", requireAdmin, noCacheMiddleware, async (req: express.Request, res: express.Response) => {
   try {
     // 1. Ensure Firestore DB initialization is awaited before querying collections
     await ensureFirestoreInitialized();
@@ -1887,7 +1892,7 @@ app.get("/api/admin/submissions", requireAdmin, async (req: express.Request, res
 });
 
 // Admin Anti-Cheat Security Audit Log Viewer Endpoint
-app.get("/api/admin/security-logs", requireAdmin, async (req: express.Request, res: express.Response) => {
+app.get("/api/admin/security-logs", requireAdmin, noCacheMiddleware, async (req: express.Request, res: express.Response) => {
   try {
     const db = await readDB();
     const users = db.users || [];
@@ -1989,7 +1994,7 @@ app.get("/api/admin/security-logs", requireAdmin, async (req: express.Request, r
 });
 
 // 1. Get current full state (Secure & Sanitized for non-admins to save bandwidth and memory)
-app.get("/api/state", async (req, res, next) => {
+app.get("/api/state", noCacheMiddleware, async (req, res, next) => {
   try {
     const forceRefresh = req.query.force_refresh === "true";
     const db = await readDB(forceRefresh);
@@ -2007,6 +2012,53 @@ app.get("/api/state", async (req, res, next) => {
       return res.status(503).json({ error: "الخدمة غير متصلة بحساب الفايربيس، تحقق من الأسرار" });
     }
     console.error("Error in /api/state:", err);
+    next(err);
+  }
+});
+
+// Dynamic Leaderboard Data Endpoint with strict cache-busting
+app.get("/api/leaderboard", noCacheMiddleware, async (req, res, next) => {
+  try {
+    const forceRefresh = req.query.force_refresh === "true";
+    const db = await readDB(forceRefresh);
+    const user = await authenticateUser(req, db);
+    const sanitized = sanitizeDBState(db, user);
+    res.json({
+      success: true,
+      users: sanitized.users,
+      attendance: sanitized.attendance,
+      tasks: sanitized.tasks,
+      quizzes: sanitized.quizzes,
+      quizSubmissions: sanitized.quizSubmissions,
+      confessions: sanitized.confessions,
+      bonuses: sanitized.bonuses,
+      config: sanitized.config,
+      quizTotals: sanitized.quizTotals,
+      quizCounts: sanitized.quizCounts,
+    });
+  } catch (err: unknown) {
+    const errObj = err as { status?: number; message?: string };
+    if (errObj?.status === 503 || isFirestoreAuthError(err)) {
+      return res.status(503).json({ error: "الخدمة غير متصلة بحساب الفايربيس، تحقق من الأسرار" });
+    }
+    console.error("Error in /api/leaderboard:", err);
+    next(err);
+  }
+});
+
+// Dynamic Quizzes Data Endpoint with strict cache-busting
+app.get("/api/quizzes", noCacheMiddleware, async (req, res, next) => {
+  try {
+    const db = await readDB();
+    const user = await authenticateUser(req, db);
+    const sanitized = sanitizeDBState(db, user);
+    res.json({
+      success: true,
+      quizzes: sanitized.quizzes,
+      quizSubmissions: sanitized.quizSubmissions,
+    });
+  } catch (err: unknown) {
+    console.error("Error in /api/quizzes:", err);
     next(err);
   }
 });

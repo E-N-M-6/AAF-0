@@ -191,6 +191,19 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   const fetchSubmissionsData = React.useCallback(async (isManual = false) => {
     setIsFetchingSubmissions(true);
     try {
+      if (isManual) {
+        const adminData = await ApiService.refreshAdminData();
+        const freshSubmissions = adminData.submissions || [];
+        onUpdateState({
+          ...adminData.db,
+          quizSubmissions: freshSubmissions.length > 0 ? freshSubmissions : (adminData.db.quizSubmissions || []),
+        });
+        setIsFetchingSubmissions(false);
+        retryCountRef.current = 0;
+        setSuccess("تم تحديث وجلب أحدث البيانات والتسليمات بنجاح! 🔄");
+        return;
+      }
+
       const res = await ApiService.getAdminSubmissions();
       const freshSubmissions = res.submissions || res.quizSubmissions || [];
 
@@ -201,9 +214,6 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
         });
         setIsFetchingSubmissions(false);
         retryCountRef.current = 0;
-        if (isManual) {
-          setSuccess("تم تحديث وجلب تسليمات الكويزات بنجاح! 🔄");
-        }
         return;
       }
 

@@ -17,7 +17,7 @@ import {
   ParsedQuestionDraft, 
   SAMPLE_ARABIC_QUIZ_TEXT 
 } from "../lib/quizParser";
-import { QuizQuestion } from "../types";
+import { QuizQuestion, QuestionType } from "../types";
 
 export interface QuizImporterProps {
   isOpen: boolean;
@@ -26,6 +26,8 @@ export interface QuizImporterProps {
   defaultMcqPoints?: number;
   defaultTrueFalsePoints?: number;
   defaultEssayPoints?: number;
+  defaultFillBlankPoints?: number;
+  defaultQuotePoints?: number;
 }
 
 export const QuizImporter: React.FC<QuizImporterProps> = ({
@@ -35,6 +37,8 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
   defaultMcqPoints = 2,
   defaultTrueFalsePoints = 1,
   defaultEssayPoints = 5,
+  defaultFillBlankPoints = 3,
+  defaultQuotePoints = 4,
 }) => {
   const [step, setStep] = useState<"input" | "preview">("input");
   const [rawText, setRawText] = useState<string>("");
@@ -54,11 +58,13 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
       rawText,
       defaultMcqPoints,
       defaultTrueFalsePoints,
-      defaultEssayPoints
+      defaultEssayPoints,
+      defaultFillBlankPoints,
+      defaultQuotePoints
     );
 
     if (result.questions.length === 0) {
-      setErrorMsg("لم نتمكن من استخراج أي سؤال صالح. يرجى التأكد من تنسيق الأسئلة وخياراتها (مثال: استخدام * للإجابة الصحيحة).");
+      setErrorMsg("لم نتمكن من استخراج أي سؤال صالح. يرجى التأكد من تنسيق الأسئلة وخياراتها.");
       return;
     }
 
@@ -79,7 +85,7 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
     });
   };
 
-  const handleChangeQuestionType = (index: number, newType: "choice" | "boolean" | "essay") => {
+  const handleChangeQuestionType = (index: number, newType: QuestionType) => {
     setParsedDrafts((prev) => {
       const next = [...prev];
       const target = next[index];
@@ -89,12 +95,18 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
       if (newType === "boolean") {
         defPts = defaultTrueFalsePoints;
         initialAns = "true";
+      } else if (newType === "fill_in_the_blank") {
+        defPts = defaultFillBlankPoints;
+        initialAns = target.modelAnswer || "";
+      } else if (newType === "quote") {
+        defPts = defaultQuotePoints;
+        initialAns = target.modelAnswer || "";
       } else if (newType === "essay") {
         defPts = defaultEssayPoints;
         initialAns = target.modelAnswer || "";
       } else {
         defPts = defaultMcqPoints;
-        initialAns = "0";
+        initialAns = "";
       }
 
       next[index] = {
@@ -123,7 +135,9 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
       next[qIndex] = { 
         ...next[qIndex], 
         correctAnswer: answerVal,
-        modelAnswer: next[qIndex].type === "essay" ? answerVal : next[qIndex].modelAnswer
+        modelAnswer: (next[qIndex].type === "essay" || next[qIndex].type === "fill_in_the_blank" || next[qIndex].type === "quote")
+          ? answerVal
+          : next[qIndex].modelAnswer
       };
       return next;
     });
@@ -136,10 +150,12 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
   const handleAutoFillAnswers = () => {
     setParsedDrafts((prev) =>
       prev.map((q) => {
-        if (q.correctAnswer.trim()) return q;
+        if (q.correctAnswer && q.correctAnswer.trim()) return q;
         if (q.type === "choice") return { ...q, correctAnswer: "0" };
         if (q.type === "boolean") return { ...q, correctAnswer: "true" };
         if (q.type === "essay") return { ...q, correctAnswer: "نموذج إجابة قياسي" };
+        if (q.type === "fill_in_the_blank") return { ...q, correctAnswer: "كلمة الفراغ" };
+        if (q.type === "quote") return { ...q, correctAnswer: "القائل المرجعي" };
         return q;
       })
     );
@@ -157,36 +173,40 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
         setErrorMsg(`السؤال رقم ${i + 1} لا يحتوي على نص سؤال`);
         return;
       }
-      if (!q.correctAnswer.trim()) {
-        setErrorMsg(`يرجى تحديد الإجابة الصحيحة أو النموذجية للسؤال رقم ${i + 1}`);
-        return;
-      }
       if (q.type === "choice") {
         if (q.options.some((opt) => !opt.trim())) {
           setErrorMsg(`السؤال رقم ${i + 1} به خيارات فارغة. يرجى ملء الخيارات الأربعة.`);
           return;
         }
+        // Delayed answer keys allowed: no error if no option is marked with asterisk
       }
     }
 
     const finalizedQuestions: QuizQuestion[] = parsedDrafts.map((q) => {
       let rubricPoints: string[] | undefined = undefined;
-      if (q.type === "essay") {
-        const lines = q.correctAnswer
+      const cleanAnswer = q.correctAnswer && q.correctAnswer.trim() ? q.correctAnswer.trim() : undefined;
+
+      if (q.type === "essay" && cleanAnswer) {
+        const lines = cleanAnswer
           .split(/[\r\n]+/)
-          .map(l => l.trim().replace(/^[\s*•\-–—✔▪▫]+/, "").replace(/^[\d٠-٩]+[\.\-\)\:]\s*/, "").trim())
+          .map((l) => l.trim().replace(/^[\s*•\-–—✔▪▫]+/, "").replace(/^[\d٠-٩]+[\.\-\)\:]\s*/, "").trim())
           .filter(Boolean);
         if (lines.length > 1) {
           rubricPoints = lines;
         }
       }
 
+      const modelAns = q.modelAnswer && q.modelAnswer.trim()
+        ? q.modelAnswer.trim()
+        : (q.type !== "choice" && q.type !== "boolean" ? cleanAnswer : undefined);
+
       return {
         id: q.id,
         type: q.type,
         questionText: q.questionText.trim(),
         options: q.type === "choice" ? [q.options[0].trim(), q.options[1].trim(), q.options[2].trim(), q.options[3].trim()] : [],
-        correctAnswer: q.correctAnswer.trim(),
+        correctAnswer: cleanAnswer,
+        modelAnswer: modelAns,
         rubricPoints,
         points: q.points,
         isCustomPoints: false
@@ -199,11 +219,14 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
 
   const optionLetters = ["أ", "ب", "ج", "د"];
   const totalCount = parsedDrafts.length;
-  const answeredCount = parsedDrafts.filter((q) => Boolean(q.correctAnswer.trim())).length;
+  const answeredCount = parsedDrafts.filter((q) => Boolean(q.correctAnswer && q.correctAnswer.trim())).length;
   const missingCount = totalCount - answeredCount;
   const mcqCount = parsedDrafts.filter((q) => q.type === "choice").length;
   const trueFalseCount = parsedDrafts.filter((q) => q.type === "boolean").length;
   const essayCount = parsedDrafts.filter((q) => q.type === "essay").length;
+  const fillBlankCount = parsedDrafts.filter((q) => q.type === "fill_in_the_blank").length;
+  const quoteCount = parsedDrafts.filter((q) => q.type === "quote").length;
+  const delayedMcqCount = parsedDrafts.filter((q) => q.type === "choice" && (!q.correctAnswer || !q.correctAnswer.trim())).length;
 
   return (
     <div 
@@ -269,12 +292,18 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
             </button>
           </div>
 
-          <div className="flex items-center gap-2 text-[10px] font-bold">
+          <div className="flex items-center gap-2 text-[10px] font-bold flex-wrap">
             <span className="bg-white dark:bg-slate-700 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-600">
               MCQ: <b className="text-emerald-600 dark:text-emerald-400">{defaultMcqPoints}</b>
             </span>
             <span className="bg-white dark:bg-slate-700 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-600">
               صح/خطأ: <b className="text-teal-600 dark:text-teal-400">{defaultTrueFalsePoints}</b>
+            </span>
+            <span className="bg-white dark:bg-slate-700 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-600">
+              أكمل: <b className="text-indigo-600 dark:text-indigo-400">{defaultFillBlankPoints}</b>
+            </span>
+            <span className="bg-white dark:bg-slate-700 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-600">
+              من القائل: <b className="text-purple-600 dark:text-purple-400">{defaultQuotePoints}</b>
             </span>
             <span className="bg-white dark:bg-slate-700 px-2 py-0.5 rounded border border-slate-200 dark:border-slate-600">
               مقالي: <b className="text-amber-600 dark:text-amber-400">{defaultEssayPoints}</b>
@@ -378,10 +407,10 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
             <div className="space-y-4">
               {/* Stats Bar */}
               <div className="bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-3 text-xs font-bold">
+                <div className="flex flex-wrap items-center gap-2.5 text-xs font-bold">
                   <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-300 bg-white dark:bg-slate-700 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600">
                     <Layers className="w-4 h-4" />
-                    <span>إجمالي الأسئلة: {totalCount}</span>
+                    <span>إجمالي: {totalCount}</span>
                   </div>
                   <div className="flex items-center gap-1.5 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/40 px-2 py-1 rounded-lg border border-blue-200 dark:border-blue-800">
                     <span>MCQ: {mcqCount}</span>
@@ -389,9 +418,20 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
                   <div className="flex items-center gap-1.5 text-teal-700 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/40 px-2 py-1 rounded-lg border border-teal-200 dark:border-teal-800">
                     <span>صح/خطأ: {trueFalseCount}</span>
                   </div>
+                  <div className="flex items-center gap-1.5 text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/40 px-2 py-1 rounded-lg border border-indigo-200 dark:border-indigo-800">
+                    <span>أكمل: {fillBlankCount}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40 px-2 py-1 rounded-lg border border-purple-200 dark:border-purple-800">
+                    <span>من القائل: {quoteCount}</span>
+                  </div>
                   <div className="flex items-center gap-1.5 text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 px-2 py-1 rounded-lg border border-amber-200 dark:border-amber-800">
                     <span>مقالي: {essayCount}</span>
                   </div>
+                  {delayedMcqCount > 0 && (
+                    <div className="flex items-center gap-1 text-orange-700 dark:text-orange-300 bg-orange-50 dark:bg-orange-950/40 px-2 py-1 rounded-lg border border-orange-200 dark:border-orange-800">
+                      <span>مفتاح مؤجل: {delayedMcqCount}</span>
+                    </div>
+                  )}
                 </div>
 
                 {missingCount > 0 && (
@@ -408,23 +448,26 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
               {/* Questions Draft Preview Cards */}
               <div className="space-y-4 max-h-[52vh] overflow-y-auto pl-1">
                 {parsedDrafts.map((q, qIdx) => {
-                  const hasAnswer = Boolean(q.correctAnswer.trim());
+                  const hasAnswer = Boolean(q.correctAnswer && q.correctAnswer.trim());
+                  const isDelayedMcq = q.type === "choice" && !hasAnswer;
                   return (
                     <div
                       key={q.id}
                       className={`p-4 rounded-xl border transition-all ${
                         hasAnswer
                           ? "bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800"
+                          : isDelayedMcq
+                          ? "bg-blue-50/40 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800"
                           : "bg-amber-50/40 dark:bg-amber-950/30 border-amber-300 dark:border-amber-700"
                       }`}
                     >
                       <div className="flex items-center justify-between flex-wrap gap-2 pb-2 mb-2 border-b border-slate-200 dark:border-slate-800">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-[11px] font-black bg-emerald-100 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 px-2.5 py-0.5 rounded-md">
                             سؤال {qIdx + 1} من {totalCount}
                           </span>
 
-                          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg text-[10px] font-bold">
+                          <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg text-[10px] font-bold flex-wrap">
                             <button
                               type="button"
                               onClick={() => handleChangeQuestionType(qIdx, "choice")}
@@ -446,6 +489,28 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
                               }`}
                             >
                               صح أم خطأ
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleChangeQuestionType(qIdx, "fill_in_the_blank")}
+                              className={`px-2 py-0.5 rounded-md transition-colors cursor-pointer ${
+                                q.type === "fill_in_the_blank"
+                                  ? "bg-indigo-600 text-white"
+                                  : "text-slate-600 dark:text-slate-400"
+                              }`}
+                            >
+                              أكمل
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleChangeQuestionType(qIdx, "quote")}
+                              className={`px-2 py-0.5 rounded-md transition-colors cursor-pointer ${
+                                q.type === "quote"
+                                  ? "bg-purple-600 text-white"
+                                  : "text-slate-600 dark:text-slate-400"
+                              }`}
+                            >
+                              من القائل
                             </button>
                             <button
                               type="button"
@@ -567,6 +632,36 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
                         </div>
                       )}
 
+                      {q.type === "fill_in_the_blank" && (
+                        <div>
+                          <label className="block text-[10px] font-bold text-indigo-700 dark:text-indigo-400 mb-1">
+                            نموذج الإجابة لإكمال الفراغ (دليل تصحيح المشرف - اختياري):
+                          </label>
+                          <input
+                            type="text"
+                            value={q.correctAnswer || ""}
+                            onChange={(e) => handleSetCorrectAnswer(qIdx, e.target.value)}
+                            placeholder="اكتب الكلمة أو العبارة المتوقعة لإكمال الفراغ..."
+                            className="w-full text-xs p-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:bg-white dark:focus:bg-slate-900 focus:border-emerald-500 outline-hidden font-semibold"
+                          />
+                        </div>
+                      )}
+
+                      {q.type === "quote" && (
+                        <div>
+                          <label className="block text-[10px] font-bold text-purple-700 dark:text-purple-400 mb-1">
+                            نموذج إسناد القول والسياق (دليل تصحيح المشرف - اختياري):
+                          </label>
+                          <textarea
+                            rows={2}
+                            value={q.correctAnswer || ""}
+                            onChange={(e) => handleSetCorrectAnswer(qIdx, e.target.value)}
+                            placeholder="اكتب القائل ومناسبة أو سياق العبارة بالتفصيل..."
+                            className="w-full text-xs p-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:bg-white dark:focus:bg-slate-900 focus:border-emerald-500 outline-hidden font-medium"
+                          />
+                        </div>
+                      )}
+
                       {q.type === "essay" && (
                         <div>
                           <label className="block text-[10px] font-bold text-amber-700 dark:text-amber-400 mb-1">
@@ -574,7 +669,7 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
                           </label>
                           <textarea
                             rows={2}
-                            value={q.correctAnswer}
+                            value={q.correctAnswer || ""}
                             onChange={(e) => handleSetCorrectAnswer(qIdx, e.target.value)}
                             placeholder="اكتب الإجابة النموذجية المرجعية بالتفصيل..."
                             className="w-full text-xs p-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:bg-white dark:focus:bg-slate-900 focus:border-emerald-500 outline-hidden font-medium"
@@ -622,15 +717,20 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
               <button
                 type="button"
                 onClick={handleFinalImport}
-                disabled={totalCount === 0 || missingCount > 0}
+                disabled={totalCount === 0}
                 className={`font-black py-2.5 px-6 rounded-xl text-xs flex items-center gap-2 transition-all shadow-xs cursor-pointer ${
-                  totalCount > 0 && missingCount === 0
+                  totalCount > 0
                     ? "bg-amber-600 hover:bg-amber-700 text-white"
                     : "bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed"
                 }`}
               >
                 <Check className="w-4 h-4 stroke-[3]" />
                 إدراج كافة الأسئلة في الاختبار ({totalCount} سؤال)
+                {delayedMcqCount > 0 && (
+                  <span className="text-[10px] bg-white/20 px-1.5 py-0.5 rounded-md font-bold">
+                    (منها {delayedMcqCount} بمفتاح مؤجل)
+                  </span>
+                )}
               </button>
             </>
           )}

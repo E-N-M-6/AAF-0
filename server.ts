@@ -704,9 +704,11 @@ interface AppNotification {
   deliveryType?: "in_app" | "both";
 }
 
+type QuestionType = "choice" | "boolean" | "essay" | "fill_in_the_blank" | "quote";
+
 interface QuizQuestion {
   id: string;
-  type: "choice" | "boolean" | "essay";
+  type: QuestionType;
   questionText: string;
   options?: string[];
   correctAnswer?: string;
@@ -776,7 +778,7 @@ interface QuizSubmission {
   totalScore: number;
   submittedAt: string;
   gradedAt?: string;
-  status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "VIOLATION_TERMINATED";
+  status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "pending_auto_grade" | "VIOLATION_TERMINATED";
   isManual?: boolean;
   violationCount?: number;
   violations?: QuizViolationRecord[];
@@ -3752,39 +3754,65 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
   const questionResults: Record<string, QuizQuestionResult> = {};
   const essayGrades: Record<string, EssayGradeItem> = {};
   let totalScore = 0;
-
-  const essayQuestions = quiz.questions.filter(q => q.type === "essay");
-  const hasEssay = essayQuestions.length > 0;
   const isViolation = status === "VIOLATION_TERMINATED";
 
   for (const question of quiz.questions) {
     const studentAnswer = (answers[question.id] || "").toString().trim();
+    const hasDefinedKey = question.correctAnswer !== undefined && question.correctAnswer !== null && question.correctAnswer.trim() !== "";
     
-    if (question.type === "choice") {
-      const isCorrect = studentAnswer === question.correctAnswer;
-      const pointsEarned = isCorrect ? question.points : 0;
-      questionResults[question.id] = {
-        pointsEarned,
-        correct: isCorrect,
-        studentAnswer,
-        feedback: isCorrect ? "إجابة صحيحة تماماً!" : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${question.options?.[parseInt(question.correctAnswer || "0", 10)] || ""}`
-      };
-      totalScore += pointsEarned;
-    } else if (question.type === "boolean") {
-      const isCorrect = studentAnswer.toLowerCase() === (question.correctAnswer || "").toLowerCase();
-      const pointsEarned = isCorrect ? question.points : 0;
-      questionResults[question.id] = {
-        pointsEarned,
-        correct: isCorrect,
-        studentAnswer,
-        feedback: isCorrect ? "إجابة صحيحة!" : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${(question.correctAnswer === "true" ? "صح" : "خطأ")}`
-      };
-      totalScore += pointsEarned;
-    } else if (question.type === "essay") {
+    if (question.type === "choice" || (question.type as string) === "mcq") {
+      if (!hasDefinedKey) {
+        questionResults[question.id] = {
+          pointsEarned: 0,
+          correct: false,
+          studentAnswer,
+          feedback: "بانتظار رصد مفتاح الإجابة الصحيحة من المشرف (تصحيح مؤجل)...",
+          status: "pending_auto_grade"
+        };
+      } else {
+        const isCorrect = studentAnswer === question.correctAnswer;
+        const pointsEarned = isCorrect ? question.points : 0;
+        questionResults[question.id] = {
+          pointsEarned,
+          correct: isCorrect,
+          studentAnswer,
+          feedback: isCorrect ? "إجابة صحيحة تماماً!" : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${question.options?.[parseInt(question.correctAnswer || "0", 10)] || ""}`,
+          status: "auto_graded"
+        };
+        totalScore += pointsEarned;
+      }
+    } else if (question.type === "boolean" || (question.type as string) === "true_false") {
+      if (!hasDefinedKey) {
+        questionResults[question.id] = {
+          pointsEarned: 0,
+          correct: false,
+          studentAnswer,
+          feedback: "بانتظار رصد مفتاح الإجابة الصحيحة من المشرف (تصحيح مؤجل)...",
+          status: "pending_auto_grade"
+        };
+      } else {
+        const isCorrect = studentAnswer.toLowerCase() === (question.correctAnswer || "").toLowerCase();
+        const pointsEarned = isCorrect ? question.points : 0;
+        questionResults[question.id] = {
+          pointsEarned,
+          correct: isCorrect,
+          studentAnswer,
+          feedback: isCorrect ? "إجابة صحيحة!" : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${(question.correctAnswer === "true" ? "صح" : "خطأ")}`,
+          status: "auto_graded"
+        };
+        totalScore += pointsEarned;
+      }
+    } else if (question.type === "fill_in_the_blank" || question.type === "quote" || question.type === "essay") {
+      const reasoning = question.type === "fill_in_the_blank"
+        ? "بانتظار مراجعة وتصحيح إكمال الفراغ من المشرف..."
+        : question.type === "quote"
+        ? "بانتظار مراجعة وتصحيح إسناد القول من المشرف..."
+        : "بانتظار تصحيح المشرف...";
+
       essayGrades[question.id] = {
         questionId: question.id,
         score: 0,
-        gradingReasoning: "بانتظار تصحيح المشرف...",
+        gradingReasoning: reasoning,
         status: "pending_manual_review",
         gradedAt: new Date().toISOString()
       };
@@ -3792,16 +3820,21 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
         pointsEarned: 0,
         correct: false,
         studentAnswer,
-        feedback: "بانتظار تصحيح المشرف...",
+        feedback: reasoning,
         status: "pending_manual_review"
       };
     }
   }
 
   totalScore = Math.round(totalScore * 100) / 100;
-  const submissionStatus: "pending_manual_review" | "completed" | "VIOLATION_TERMINATED" = isViolation
+  const hasPendingAuto = Object.values(questionResults).some(r => r.status === "pending_auto_grade");
+  const hasPendingManual = Object.values(questionResults).some(r => r.status === "pending_manual_review");
+
+  const submissionStatus: "pending_auto_grade" | "pending_manual_review" | "completed" | "VIOLATION_TERMINATED" = isViolation
     ? "VIOLATION_TERMINATED"
-    : (hasEssay ? "pending_manual_review" : "completed");
+    : (hasPendingAuto
+      ? "pending_auto_grade"
+      : (hasPendingManual ? "pending_manual_review" : "completed"));
 
   const newSubmission: QuizSubmission = {
     id: "sub_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
@@ -3841,9 +3874,11 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
   const participant = db.users.find(u => u.id === userId);
   const notifMsg = isViolation
     ? `⚠️ تم إيقاف وتسليم اختبار "${quiz.title}" للمشارك ${participant?.name || ""} بسبب رصد مخالفة أمنية ومغادرة شاشة الامتحان.`
-    : submissionStatus === "pending_manual_review"
-      ? `تهانينا للمشارك ${participant?.name || ""}! لقد قمت بتسليم إجاباتك لاختبار "${quiz.title}" بنجاح وهو الآن بانتظار تصحيح الجزء المقالي من المشرف! 🎉`
-      : `تهانينا للمشارك ${participant?.name || ""}! لقد أنجزت حل اختبار "${quiz.title}" بنجاح وحصلت على ${totalScore} من أصل ${quiz.points} نقطة! 🎉`;
+    : submissionStatus === "pending_auto_grade"
+      ? `تهانينا للمشارك ${participant?.name || ""}! تم تسليم إجاباتك لاختبار "${quiz.title}" بنجاح، وسيتم احتساب النتيجة فور اعتماد مفتاح الإجابات من المشرف! 🎉`
+      : submissionStatus === "pending_manual_review"
+        ? `تهانينا للمشارك ${participant?.name || ""}! لقد قمت بتسليم إجاباتك لاختبار "${quiz.title}" بنجاح وهو الآن بانتظار تصحيح المشرف! 🎉`
+        : `تهانينا للمشارك ${participant?.name || ""}! لقد أنجزت حل اختبار "${quiz.title}" بنجاح وحصلت على ${totalScore} من أصل ${quiz.points} نقطة! 🎉`;
   
   const newNotification: AppNotification = {
     id: "notif_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
@@ -3863,9 +3898,11 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
   res.status(200).json({
     message: isViolation
       ? "تم إيقاف الامتحان وتسليم المحاولة لمخالفة قواعد النزاهة الأمنية."
-      : submissionStatus === "pending_manual_review"
-        ? "تم تسليم الاختبار بنجاح وبانتظار تصحيح الجزء المقالي من المشرف!"
-        : "تم تسليم وحل الاختبار وتقييمه بنجاح!",
+      : submissionStatus === "pending_auto_grade"
+        ? "تم تسليم الاختبار بنجاح، وسيتم احتساب النتيجة فور توفير مفتاح الإجابات!"
+        : submissionStatus === "pending_manual_review"
+          ? "تم تسليم الاختبار بنجاح وبانتظار تصحيح المشرف!"
+          : "تم تسليم وحل الاختبار وتقييمه بنجاح!",
     submission: existingIdx !== -1 ? db.quizSubmissions[existingIdx] : newSubmission,
     db: sanitizeDBState(db, user)
   });
@@ -3920,12 +3957,12 @@ app.post(["/api/admin/grade-essay", "/api/admin/grade-essay-manual", "/api/admin
 
   for (const qId of Object.keys(gradesMap)) {
     const question = quiz.questions.find(q => q.id === qId);
-    if (question && question.type === "essay") {
+    if (question && (question.type === "essay" || question.type === "fill_in_the_blank" || question.type === "quote")) {
       const grade = gradesMap[qId];
       const maxPoints = question.points;
       const pointsEarned = Math.max(0, Math.min(maxPoints, parseFloat(String(grade.pointsEarned || 0))));
       const correct = pointsEarned >= (maxPoints / 2);
-      const feedback = grade.feedback?.trim() || "تم تصحيح الإجابة المقالية يدوياً ورصد الدرجة بنجاح.";
+      const feedback = grade.feedback?.trim() || "تم تصحيح الإجابة يدوياً ورصد الدرجة بنجاح.";
 
       submission.essayGrades[qId] = {
         questionId: qId,
@@ -3957,7 +3994,9 @@ app.post(["/api/admin/grade-essay", "/api/admin/grade-essay-manual", "/api/admin
   }
 
   submission.totalScore = Math.round(totalScore * 100) / 100;
-  submission.status = "graded";
+  const stillPendingAuto = Object.values(submission.questionResults).some(r => r.status === "pending_auto_grade");
+  const stillPendingManual = Object.values(submission.questionResults).some(r => r.status === "pending_manual_review");
+  submission.status = stillPendingAuto ? "pending_auto_grade" : (stillPendingManual ? "pending_manual_review" : "graded");
   submission.gradedAt = new Date().toISOString();
 
   const participant = db.users.find(u => u.id === submission.userId);
@@ -3984,6 +4023,173 @@ app.post(["/api/admin/grade-essay", "/api/admin/grade-essay-manual", "/api/admin
     message: "تم حفظ ورصد درجات الأسئلة المقالية وتحديث النتيجة النهائية بنجاح",
     submission,
     db: sanitizeDBState(db, user)
+  });
+}));
+
+// 12.8 Phase 6.2 - Delayed Batch-Grading Engine (Admin Only)
+app.post(["/api/admin/quizzes/:quizId/batch-grade", "/api/quizzes/:quizId/batch-grade"], requireAdmin, mutexHandler(async (req, res) => {
+  const quizId = (req.params.quizId || req.body.quizId || "").trim();
+  const { answerKey } = req.body;
+
+  if (!quizId) {
+    return res.status(400).json({ error: "معرف الاختبار مطلوب" });
+  }
+
+  if (!answerKey || typeof answerKey !== "object" || Object.keys(answerKey).length === 0) {
+    return res.status(400).json({ error: "نموذج الإجابة مطلوب ويجب أن يحتوي على إجابة واحدة على الأقل" });
+  }
+
+  const db = await readDB();
+  const quiz = db.quizzes?.find((q) => q.id === quizId);
+  if (!quiz) {
+    return res.status(404).json({ error: "الاختبار غير موجود" });
+  }
+
+  // 1. Inject the new correctAnswer indices into the respective questions in the Quiz document
+  for (const question of quiz.questions) {
+    if (answerKey[question.id] !== undefined && answerKey[question.id] !== null) {
+      const correctOptionIndex = answerKey[question.id];
+      const isBoolean = question.type === "boolean" || (question.type as string) === "true_false";
+      if (isBoolean) {
+        question.correctAnswer = (correctOptionIndex === 0 || String(correctOptionIndex) === "true") ? "true" : "false";
+      } else {
+        question.correctAnswer = String(correctOptionIndex);
+      }
+    }
+  }
+
+  // 2. Query/filter all QuizSubmission documents for this quizId where status is pending_auto_grade
+  if (!db.quizSubmissions) {
+    db.quizSubmissions = [];
+  }
+
+  const pendingSubmissions = db.quizSubmissions.filter(
+    (s) => s.quizId === quizId && (s.status === "pending_auto_grade" || Object.values(s.questionResults || {}).some(r => r.status === "pending_auto_grade"))
+  );
+
+  let updatedCount = 0;
+
+  // 3. Re-evaluation Loop
+  for (const submission of pendingSubmissions) {
+    if (!submission.questionResults) {
+      submission.questionResults = {};
+    }
+
+    for (const question of quiz.questions) {
+      if (answerKey[question.id] !== undefined && answerKey[question.id] !== null) {
+        const correctOptionIndex = answerKey[question.id];
+        const studentAnswer = (submission.answers?.[question.id] || "").toString().trim();
+        const isBoolean = question.type === "boolean" || (question.type as string) === "true_false";
+
+        let isCorrect = false;
+        if (isBoolean) {
+          const normStudent = studentAnswer.toLowerCase();
+          const targetBoolStr = (correctOptionIndex === 0 || String(correctOptionIndex) === "true") ? "true" : "false";
+          isCorrect = normStudent === targetBoolStr || normStudent === String(correctOptionIndex);
+        } else {
+          isCorrect = studentAnswer === String(correctOptionIndex);
+        }
+
+        const pointsEarned = isCorrect ? question.points : 0;
+        const optionText = isBoolean
+          ? (question.correctAnswer === "true" ? "صح" : "خطأ")
+          : (question.options?.[parseInt(String(correctOptionIndex), 10)] || "");
+
+        submission.questionResults[question.id] = {
+          pointsEarned,
+          correct: isCorrect,
+          studentAnswer,
+          feedback: isCorrect
+            ? "إجابة صحيحة تماماً!"
+            : `إجابة غير صحيحة. الإجابة الصحيحة هي: ${optionText}`,
+          status: "auto_graded",
+          autoGraded: true,
+        };
+      }
+    }
+
+    // Recalculate totalScore cleanly across all question results
+    let totalScore = 0;
+    if (submission.questionResults) {
+      for (const res of Object.values(submission.questionResults)) {
+        if (res && typeof res.pointsEarned === "number" && !isNaN(res.pointsEarned)) {
+          totalScore += res.pointsEarned;
+        }
+      }
+    }
+    submission.totalScore = Math.round(totalScore * 100) / 100;
+
+    // Status resolution:
+    // If the submission still has essay/fill-in-the-blank questions pending, set overall status to "pending_manual_review". Otherwise, set it to "graded".
+    const stillPendingAuto = Object.values(submission.questionResults).some((r) => r.status === "pending_auto_grade");
+    const stillPendingManual = Object.values(submission.questionResults).some((r) => r.status === "pending_manual_review");
+
+    if (stillPendingAuto) {
+      submission.status = "pending_auto_grade";
+    } else if (stillPendingManual) {
+      submission.status = "pending_manual_review";
+    } else {
+      submission.status = "graded";
+    }
+    submission.gradedAt = new Date().toISOString();
+    updatedCount++;
+  }
+
+  // 4. Batch updates in Firestore with chunking (Firestore limit is 500)
+  const dbFs = getFirestore();
+  if (dbFs) {
+    try {
+      const directSubsSnap = await dbFs
+        .collection("quizSubmissions")
+        .where("quizId", "==", quizId)
+        .get()
+        .catch(() => null);
+
+      if (directSubsSnap && !directSubsSnap.empty) {
+        const docs = directSubsSnap.docs;
+        const CHUNK_SIZE = 400;
+        for (let i = 0; i < docs.length; i += CHUNK_SIZE) {
+          const chunk = docs.slice(i, i + CHUNK_SIZE);
+          const batch = dbFs.batch();
+          for (const doc of chunk) {
+            const updated = pendingSubmissions.find((s) => s.id === doc.id);
+            if (updated) {
+              batch.set(doc.ref, updated, { merge: true });
+            }
+          }
+          await batch.commit();
+        }
+      }
+    } catch (directErr) {
+      console.warn("Direct Firestore collection update notice (handled by appState):", directErr);
+    }
+  }
+
+  // 5. Add notification
+  const notifMsg = `📝 تم اعتماد نموذج الإجابة وتصحيح ${updatedCount} تسليماً تلقائياً لاختبار "${quiz.title}"! 🎉`;
+  const newNotification: AppNotification = {
+    id: "notif_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
+    message: notifMsg,
+    createdAt: new Date().toISOString(),
+  };
+  if (!db.notifications) {
+    db.notifications = [];
+  }
+  db.notifications.push(newNotification);
+  if (db.notifications.length > 50) {
+    db.notifications = db.notifications.slice(-50);
+  }
+
+  // Persist full state to appState and local DB
+  await queueWriteDB(db);
+
+  const user = await authenticateUser(req);
+  res.status(200).json({
+    success: true,
+    message: `تم اعتماد نموذج الإجابة بنجاح وإعادة تقييم ${updatedCount} تسليماً معلقاً!`,
+    quiz,
+    gradedCount: updatedCount,
+    db: sanitizeDBState(db, user),
   });
 }));
 

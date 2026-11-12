@@ -1,4 +1,4 @@
-import { DatabaseState, User, UserProfile, QuizQuestion, WebPushSubscription } from "../types";
+import { DatabaseState, User, UserProfile, Quiz, QuizQuestion, WebPushSubscription } from "../types";
 export type { UserProfile };
 
 export class ApiError extends Error {
@@ -775,6 +775,23 @@ export const ApiService = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ quizId }),
     });
+  },
+
+  /**
+   * Attach answer key to an un-keyed quiz and batch-grade all pending submissions (Phase 6.2)
+   */
+  async attachAnswerKeyAndGrade(
+    quizId: string,
+    answerKey: Record<string, number>
+  ): Promise<{ success: boolean; message: string; quiz: Quiz; gradedCount: number; db: DatabaseState }> {
+    return fetchJson<{ success: boolean; message: string; quiz: Quiz; gradedCount: number; db: DatabaseState }>(
+      `/api/admin/quizzes/${encodeURIComponent(quizId)}/batch-grade`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ quizId, answerKey }),
+      }
+    );
   },
 
   /**

@@ -24,10 +24,11 @@ import {
   AlertTriangle,
   Zap,
 } from "lucide-react";
-import { DatabaseState, QuizSubmission, Quiz, User, QuizViolationRecord, AdminSecurityLogItem } from "../types";
+import { DatabaseState, QuizSubmission, Quiz, User, QuizViolationRecord, AdminSecurityLogItem, QuizQuestionResult } from "../types";
 import { ApiService } from "../services/api";
 import { ManualReviewModal } from "./ManualReviewModal";
 import { QuizImporter } from "./QuizImporter";
+import { PostGradingModal } from "./PostGradingModal";
 
 interface AdminDashboardProps {
   state: DatabaseState;
@@ -43,11 +44,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   isLoading = false,
 }) => {
   const [activeMainTab, setActiveMainTab] = useState<"submissions" | "security_logs">("submissions");
-  const [filterTab, setFilterTab] = useState<"all" | "pending_review" | "graded">("all");
+  const [filterTab, setFilterTab] = useState<"all" | "pending_auto_grade" | "pending_review" | "graded">("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [logSearchQuery, setLogSearchQuery] = useState("");
   const [logTypeFilter, setLogTypeFilter] = useState<string>("all");
   const [selectedSubmissionForReview, setSelectedSubmissionForReview] = useState<QuizSubmission | null>(null);
+  const [selectedQuizForPostGrading, setSelectedQuizForPostGrading] = useState<Quiz | null>(null);
   const [isImporterOpen, setIsImporterOpen] = useState(false);
   const [securityLogs, setSecurityLogs] = useState<AdminSecurityLogItem[]>([]);
   const [isLoadingLogs, setIsLoadingLogs] = useState<boolean>(false);
@@ -56,6 +58,26 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const quizzes = state?.quizzes || [];
   const users = state?.users || [];
   const violationsFromState = state?.quizViolations || [];
+
+  // Identify quizzes that contain un-keyed MCQ or True-False questions
+  const quizzesNeedingKey = React.useMemo(() => {
+    return quizzes.filter((quiz) => {
+      return quiz.questions?.some((q) => {
+        const isMcqOrBool =
+          q.type === "choice" ||
+          q.type === "boolean" ||
+          (q.type as string) === "mcq" ||
+          (q.type as string) === "true_false";
+        if (!isMcqOrBool) return false;
+        return (
+          q.correctAnswer === undefined ||
+          q.correctAnswer === null ||
+          q.correctAnswer === "" ||
+          q.correctAnswer === "-1"
+        );
+      });
+    });
+  }, [quizzes]);
 
   const getUserName = (userId: string) => {
     const user = users.find((u) => u.id === userId);
@@ -152,6 +174,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
     if (!matchesSearch) return false;
 
+    if (filterTab === "pending_auto_grade") {
+      return (
+        sub.status === "pending_auto_grade" ||
+        Object.values(sub.questionResults || {}).some((r: QuizQuestionResult) => r.status === "pending_auto_grade")
+      );
+    }
     if (filterTab === "pending_review") {
       return sub.status === "pending_manual_review";
     }
@@ -179,6 +207,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     return true;
   });
 
+  const pendingAutoCount = submissions.filter(
+    (s) =>
+      s.status === "pending_auto_grade" ||
+      Object.values(s.questionResults || {}).some((r: QuizQuestionResult) => r.status === "pending_auto_grade")
+  ).length;
   const pendingCount = submissions.filter((s) => s.status === "pending_manual_review").length;
   const gradedCount = submissions.filter((s) => s.status === "graded" || s.status === "completed").length;
   const terminatedCount = submissions.filter((s) => s.status === "VIOLATION_TERMINATED").length;
@@ -206,6 +239,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
         {/* Action Bar Buttons */}
         <div className="flex items-center gap-2.5 w-full md:w-auto justify-end flex-wrap">
+          {quizzesNeedingKey.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setSelectedQuizForPostGrading(quizzesNeedingKey[0])}
+              className="bg-amber-500 hover:bg-amber-600 text-white font-black px-4 py-2.5 rounded-xl text-xs flex items-center gap-2 transition-all shadow-xs cursor-pointer animate-pulse"
+            >
+              <FileText className="w-4 h-4 text-white" />
+              <span>إرفاق نموذج الإجابة 📝</span>
+              <span className="bg-amber-700 text-white text-[10px] px-1.5 py-0.5 rounded-full font-black">
+                {quizzesNeedingKey.length}
+              </span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setIsImporterOpen(true)}
@@ -285,6 +332,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </button>
               <button
                 type="button"
+                onClick={() => setFilterTab("pending_auto_grade")}
+                className={`px-4 py-2 rounded-lg transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+                  filterTab === "pending_auto_grade"
+                    ? "bg-amber-600 text-white shadow-xs"
+                    : "text-amber-800 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-950/40"
+                }`}
+              >
+                <span>بانتظار نموذج الإجابة</span>
+                {pendingAutoCount > 0 && (
+                  <span className="bg-amber-800 text-white text-[10px] px-1.5 py-0.5 rounded-full font-black">
+                    {pendingAutoCount}
+                  </span>
+                )}
+              </button>
+              <button
+                type="button"
                 onClick={() => setFilterTab("pending_review")}
                 className={`px-4 py-2 rounded-lg transition-all cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
                   filterTab === "pending_review"
@@ -323,6 +386,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
           </div>
 
+          {/* Un-keyed Quizzes Action Banner */}
+          {quizzesNeedingKey.length > 0 && (
+            <div className="bg-gradient-to-r from-amber-500/10 via-amber-500/15 to-amber-500/5 dark:from-amber-950/40 dark:to-amber-950/20 border border-amber-300 dark:border-amber-700/80 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-2xs">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center shrink-0 shadow-sm">
+                  <AlertCircle className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h4 className="text-xs sm:text-sm font-black text-amber-900 dark:text-amber-200">
+                    يوجد {quizzesNeedingKey.length} اختبار يحتوي على أسئلة اختيارية بدون نموذج إجابة معتمد
+                  </h4>
+                  <p className="text-[11px] font-semibold text-amber-700 dark:text-amber-400 mt-0.5">
+                    يمكنك الآن إرفاق نموذج الإجابة لتصحيح كافة الإجابات المعلقة وحساب نتائج المشاركين فورياً.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setSelectedQuizForPostGrading(quizzesNeedingKey[0])}
+                  className="bg-amber-500 hover:bg-amber-600 text-white font-black px-4 py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all shadow-xs cursor-pointer w-full sm:w-auto"
+                >
+                  <FileText className="w-4 h-4" />
+                  <span>إرفاق نموذج الإجابة 📝</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Submissions List or Skeleton Loading */}
           {isLoading ? (
             <div className="space-y-3">
@@ -356,9 +449,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               {filteredSubmissions.map((sub) => {
                 const quiz = getQuiz(sub.quizId);
                 const userName = getUserName(sub.userId);
+                const isPendingAuto =
+                  sub.status === "pending_auto_grade" ||
+                  Object.values(sub.questionResults || {}).some((r: QuizQuestionResult) => r.status === "pending_auto_grade");
                 const isPending = sub.status === "pending_manual_review";
                 const isTerminated = sub.status === "VIOLATION_TERMINATED";
                 const essayCount = quiz?.questions.filter((q) => q.type === "essay").length || 0;
+                const hasUnkeyedQuestions = Boolean(
+                  quiz &&
+                    (quiz.questions || []).some(
+                      (q) =>
+                        (q.type === "choice" ||
+                          q.type === "boolean" ||
+                          (q.type as string) === "mcq" ||
+                          (q.type as string) === "true_false") &&
+                        (!q.correctAnswer || !q.correctAnswer.trim() || q.correctAnswer === "-1")
+                    )
+                );
 
                 return (
                   <div
@@ -366,6 +473,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     className={`bg-white dark:bg-slate-900 p-4 sm:p-5 rounded-2xl border transition-all flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shadow-2xs ${
                       isTerminated
                         ? "border-rose-400 dark:border-rose-800 bg-rose-50/40 dark:bg-rose-950/20"
+                        : isPendingAuto
+                        ? "border-amber-400 dark:border-amber-700 bg-amber-50/25 dark:bg-amber-950/15"
                         : isPending
                         ? "border-amber-300 dark:border-amber-700/60 bg-amber-50/20 dark:bg-amber-950/10"
                         : "border-slate-200 dark:border-slate-800 hover:border-slate-300"
@@ -380,6 +489,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                           className={`px-2.5 py-0.5 rounded-full font-black text-[10px] ${
                             isTerminated
                               ? "bg-rose-100 text-rose-800 border border-rose-300 dark:bg-rose-950 dark:text-rose-200"
+                              : isPendingAuto
+                              ? "bg-amber-100 text-amber-900 border border-amber-400 dark:bg-amber-950 dark:text-amber-200"
                               : isPending
                               ? "bg-amber-100 text-amber-800 border border-amber-300"
                               : "bg-emerald-100 text-emerald-800 border border-emerald-300"
@@ -387,6 +498,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         >
                           {isTerminated
                             ? "⛔ ملغى بسبب مخالفة أمنية"
+                            : isPendingAuto
+                            ? "⏳ بانتظار نموذج الإجابة"
                             : isPending
                             ? "⏳ بانتظار التصحيح اليدوي"
                             : "✓ تم التصحيح والاعتماد"}
@@ -407,7 +520,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       </p>
                     </div>
 
-                    <div className="flex items-center gap-3 self-end md:self-auto">
+                    <div className="flex items-center gap-2.5 self-end md:self-auto flex-wrap">
+                      {hasUnkeyedQuestions && quiz && (
+                        <button
+                          type="button"
+                          onClick={() => setSelectedQuizForPostGrading(quiz)}
+                          className="bg-amber-500 hover:bg-amber-600 text-white font-black px-3.5 py-2 rounded-xl text-xs flex items-center gap-1.5 transition-all shadow-2xs cursor-pointer"
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          إرفاق نموذج الإجابة 📝
+                        </button>
+                      )}
+
                       {essayCount > 0 && (
                         <button
                           type="button"
@@ -689,6 +813,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           onClose={() => setIsImporterOpen(false)}
           onImport={(importedQuestions) => {
             setIsImporterOpen(false);
+          }}
+        />
+      )}
+
+      {/* Post-Grading Answer Key & Batch-Grading Modal */}
+      {selectedQuizForPostGrading && (
+        <PostGradingModal
+          isOpen={!!selectedQuizForPostGrading}
+          onClose={() => setSelectedQuizForPostGrading(null)}
+          quiz={selectedQuizForPostGrading}
+          quizzes={quizzesNeedingKey.length > 0 ? quizzesNeedingKey : quizzes}
+          onGraded={(updatedDb) => {
+            onUpdateState(updatedDb);
+            setSelectedQuizForPostGrading(null);
           }}
         />
       )}

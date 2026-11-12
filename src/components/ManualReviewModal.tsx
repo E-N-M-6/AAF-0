@@ -27,9 +27,11 @@ export const ManualReviewModal: React.FC<ManualReviewModalProps> = ({
   useEffect(() => {
     if (submission && quiz) {
       const initial: Record<string, { score: number; feedback: string }> = {};
-      const essayQuestions = (quiz.questions || []).filter((q) => q.type === "essay");
+      const manualQuestions = (quiz.questions || []).filter(
+        (q) => q.type === "essay" || q.type === "fill_in_the_blank" || q.type === "quote"
+      );
 
-      essayQuestions.forEach((q) => {
+      manualQuestions.forEach((q) => {
         const existingResult = submission.questionResults?.[q.id];
         const existingEssayGrade = submission.essayGrades?.[q.id];
 
@@ -56,7 +58,9 @@ export const ManualReviewModal: React.FC<ManualReviewModalProps> = ({
 
   if (!isOpen || !submission || !quiz) return null;
 
-  const essayQuestions = (quiz.questions || []).filter((q) => q.type === "essay");
+  const essayQuestions = (quiz.questions || []).filter(
+    (q) => q.type === "essay" || q.type === "fill_in_the_blank" || q.type === "quote"
+  );
 
   const handleScoreChange = (questionId: string, maxPoints: number, val: number) => {
     const boundedScore = Math.max(0, Math.min(maxPoints, isNaN(val) ? 0 : val));
@@ -119,7 +123,7 @@ export const ManualReviewModal: React.FC<ManualReviewModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-black flex items-center gap-2">
-                مراجعة وتصحيح الأسئلة المقالية
+                مراجعة وتصحيح الأسئلة المقالية واليدوية
               </h3>
               <p className="text-xs text-white/80 font-medium">
                 المشارك: <span className="font-bold underline text-amber-200">{participantName}</span> • الاختبار: {quiz.title}
@@ -153,7 +157,7 @@ export const ManualReviewModal: React.FC<ManualReviewModalProps> = ({
 
           <div className="flex items-center gap-3 font-bold text-[11px]">
             <span className="bg-white dark:bg-slate-700 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600">
-              عدد الأسئلة المقالية: <b className="text-emerald-600 dark:text-emerald-400">{essayQuestions.length}</b>
+              أسئلة المراجعة اليدوية: <b className="text-emerald-600 dark:text-emerald-400">{essayQuestions.length}</b>
             </span>
             <span className="bg-white dark:bg-slate-700 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600">
               تاريخ التسليم: <b>{new Date(submission.submittedAt).toLocaleDateString("ar-EG")}</b>
@@ -182,7 +186,7 @@ export const ManualReviewModal: React.FC<ManualReviewModalProps> = ({
         <div className="p-4 sm:p-5 overflow-y-auto flex-1 space-y-6">
           {essayQuestions.length === 0 ? (
             <div className="p-8 text-center text-slate-500 font-bold text-xs">
-              لا توجد أسئلة مقالية في هذا الاختبار لتصحيحها.
+              لا توجد أسئلة تتطلب مراجعة يدوية في هذا الاختبار.
             </div>
           ) : (
             essayQuestions.map((q, idx) => {
@@ -202,9 +206,14 @@ export const ManualReviewModal: React.FC<ManualReviewModalProps> = ({
                       </span>
                       {q.questionText}
                     </h4>
-                    <span className="text-xs font-black bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-200 px-3 py-1 rounded-lg border border-amber-300 dark:border-amber-700">
-                      الدرجة القصوى: {q.points} نقاط
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] font-extrabold px-2.5 py-1 rounded-lg bg-teal-100 text-teal-800 dark:bg-teal-900/60 dark:text-teal-200 border border-teal-200 dark:border-teal-800">
+                        {q.type === "quote" ? "📜 من القائل" : q.type === "fill_in_the_blank" ? "✏️ أكمل الفراغ" : "📝 سؤال مقالي"}
+                      </span>
+                      <span className="text-xs font-black bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-200 px-3 py-1 rounded-lg border border-amber-300 dark:border-amber-700">
+                        الدرجة القصوى: {q.points} نقاط
+                      </span>
+                    </div>
                   </div>
 
                   {/* Side-by-side Answer & Model Guide Comparison */}

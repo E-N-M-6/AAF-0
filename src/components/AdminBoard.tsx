@@ -1,11 +1,12 @@
 import React, { useState, lazy, Suspense } from "react";
 import { createPortal } from "react-dom";
-import { User, Attendance, Task, DatabaseState, ConfessionMonth, QuizQuestion } from "../types";
+import { User, Attendance, Task, DatabaseState, ConfessionMonth, QuizQuestion, Quiz, QuestionType } from "../types";
 import { ApiService } from "../services/api";
 import { AuthenticatedImage } from "./AuthenticatedImage";
 import { BulkQuizImportModal } from "./BulkQuizImportModal";
 import { calculateParticipantScore } from "../lib/score";
 import { AdminDashboard } from "./AdminDashboard";
+import { PostGradingModal } from "./PostGradingModal";
 import { 
   Users, 
   CalendarDays, 
@@ -73,6 +74,9 @@ function isRawJsonError(text?: string): boolean {
 export default function AdminBoard({ state, onUpdateState, setError, setSuccess }: AdminBoardProps) {
   const [activeTab, setActiveTab] = useState<"attendance" | "tasks_review" | "assign_task" | "manage_users" | "broadcast" | "quizzes" | "confessions" | "bonus_quiz_manual">("attendance");
   
+  // Post-Grading Modal State (Phase 6.2)
+  const [postGradingQuiz, setPostGradingQuiz] = useState<Quiz | null>(null);
+  
   // Broadcast Tab State
   const [broadcastMessage, setBroadcastMessage] = useState("");
   const [isBroadcasting, setIsBroadcasting] = useState(false);
@@ -122,6 +126,8 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
   const [defaultMcqPoints, setDefaultMcqPoints] = useState<number>(2);
   const [defaultTrueFalsePoints, setDefaultTrueFalsePoints] = useState<number>(1);
   const [defaultEssayPoints, setDefaultEssayPoints] = useState<number>(5);
+  const [defaultFillBlankPoints, setDefaultFillBlankPoints] = useState<number>(3);
+  const [defaultQuotePoints, setDefaultQuotePoints] = useState<number>(4);
   const [isBulkImportOpen, setIsBulkImportOpen] = useState<boolean>(false);
   const [selectedSubmissionDetails, setSelectedSubmissionDetails] = useState<any | null>(null);
   const [essayGrades, setEssayGrades] = useState<Record<string, { pointsEarned: number; feedback: string }>>({});
@@ -701,17 +707,43 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
     }));
   };
 
+  const handleDefaultFillBlankPointsChange = (val: number) => {
+    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    setDefaultFillBlankPoints(pts);
+    setNewQuizQuestions(prev => prev.map(q => {
+      if (q.type === "fill_in_the_blank" && !q.isCustomPoints) {
+        return { ...q, points: pts };
+      }
+      return q;
+    }));
+  };
+
+  const handleDefaultQuotePointsChange = (val: number) => {
+    const pts = Math.max(1, isNaN(val) ? 1 : val);
+    setDefaultQuotePoints(pts);
+    setNewQuizQuestions(prev => prev.map(q => {
+      if (q.type === "quote" && !q.isCustomPoints) {
+        return { ...q, points: pts };
+      }
+      return q;
+    }));
+  };
+
   const handleBulkImportQuestions = (imported: QuizQuestion[]) => {
     setNewQuizQuestions(prev => [...prev, ...imported]);
     setSuccess(`تم بنجاح استيراد ${imported.length} سؤال وإضافتها للاختبار! 📋✨`);
   };
 
-  const handleAddQuestion = (type: "choice" | "boolean" | "essay") => {
+  const handleAddQuestion = (type: QuestionType) => {
     const pts = type === "choice" 
       ? defaultMcqPoints 
       : type === "boolean" 
         ? defaultTrueFalsePoints 
-        : defaultEssayPoints;
+        : type === "fill_in_the_blank"
+          ? defaultFillBlankPoints
+          : type === "quote"
+            ? defaultQuotePoints
+            : defaultEssayPoints;
 
     const newQ = {
       id: "q_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
@@ -722,7 +754,32 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
       points: pts,
       isCustomPoints: false
     };
-    setNewQuizQuestions([...newQuizQuestions, newQ]);
+    setNewQuizQuestions(prev => [...prev, newQ]);
+  };
+
+  const handleUpdateQuestionType = (idx: number, newType: QuestionType) => {
+    setNewQuizQuestions(prev => {
+      const next = [...prev];
+      const target = next[idx];
+      const pts = newType === "choice"
+        ? defaultMcqPoints
+        : newType === "boolean"
+          ? defaultTrueFalsePoints
+          : newType === "fill_in_the_blank"
+            ? defaultFillBlankPoints
+            : newType === "quote"
+              ? defaultQuotePoints
+              : defaultEssayPoints;
+
+      next[idx] = {
+        ...target,
+        type: newType,
+        points: target.isCustomPoints ? target.points : pts,
+        options: newType === "choice" ? (target.options?.length === 4 ? target.options : ["", "", "", ""]) : [],
+        correctAnswer: newType === "boolean" ? (target.correctAnswer === "false" ? "false" : "true") : (newType === "choice" ? "" : target.correctAnswer || "")
+      };
+      return next;
+    });
   };
 
   const handleRemoveQuestion = (idx: number) => {
@@ -766,13 +823,10 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
           setError(`يرجى ملء جميع اختيارات السؤال رقم ${i + 1}`);
           return;
         }
-        if (q.correctAnswer === "") {
-          setError(`يرجى تحديد الإجابة الصحيحة للسؤال رقم ${i + 1}`);
-          return;
-        }
+        // Delayed answer keys allowed: no error if correctAnswer is empty
       }
-      if (q.type === "essay" && !q.correctAnswer.trim()) {
-        setError(`يرجى كتابة نموذج الإجابة الصحيحة للسؤال المقالي رقم ${i + 1} لمساعدة لجنة التقييم في التصحيح التلقائي والمراجعة`);
+      if (q.type === "essay" && (!q.correctAnswer || !q.correctAnswer.trim())) {
+        setError(`يرجى كتابة نموذج الإجابة الصحيحة للسؤال المقالي رقم ${i + 1} لمساعدة لجنة التقييم في التصحيح والمراجعة`);
         return;
       }
     }
@@ -1958,7 +2012,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                       </span>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-2">
                       <div className="bg-natural-cream/35 border border-natural-border/70 rounded-xl p-2.5 flex items-center justify-between gap-2">
                         <div>
                           <span className="text-[11px] font-bold text-natural-green block">اختيار من متعدد:</span>
@@ -1970,7 +2024,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             min="1"
                             value={defaultMcqPoints}
                             onChange={(e) => handleDefaultMcqPointsChange(parseInt(e.target.value, 10))}
-                            className="w-14 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
+                            className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
                         </div>
@@ -1987,7 +2041,41 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             min="1"
                             value={defaultTrueFalsePoints}
                             onChange={(e) => handleDefaultTrueFalsePointsChange(parseInt(e.target.value, 10))}
-                            className="w-14 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
+                            className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
+                          />
+                          <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
+                        </div>
+                      </div>
+
+                      <div className="bg-natural-cream/35 border border-natural-border/70 rounded-xl p-2.5 flex items-center justify-between gap-2">
+                        <div>
+                          <span className="text-[11px] font-bold text-indigo-700 block">أكمل الفراغ:</span>
+                          <span className="text-[9px] text-natural-muted font-medium">Fill in Blank</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="number"
+                            min="1"
+                            value={defaultFillBlankPoints}
+                            onChange={(e) => handleDefaultFillBlankPointsChange(parseInt(e.target.value, 10))}
+                            className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
+                          />
+                          <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
+                        </div>
+                      </div>
+
+                      <div className="bg-natural-cream/35 border border-natural-border/70 rounded-xl p-2.5 flex items-center justify-between gap-2">
+                        <div>
+                          <span className="text-[11px] font-bold text-purple-700 block">من القائل:</span>
+                          <span className="text-[9px] text-natural-muted font-medium">Quote</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="number"
+                            min="1"
+                            value={defaultQuotePoints}
+                            onChange={(e) => handleDefaultQuotePointsChange(parseInt(e.target.value, 10))}
+                            className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
                         </div>
@@ -2004,7 +2092,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             min="1"
                             value={defaultEssayPoints}
                             onChange={(e) => handleDefaultEssayPointsChange(parseInt(e.target.value, 10))}
-                            className="w-14 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
+                            className="w-12 text-xs font-black text-center p-1.5 rounded-lg border border-natural-border bg-white focus:border-natural-green outline-hidden"
                           />
                           <span className="text-[10px] text-natural-muted font-bold">نقاط</span>
                         </div>
@@ -2029,23 +2117,37 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                       <button
                         type="button"
                         onClick={() => handleAddQuestion("choice")}
-                        className="bg-natural-green hover:bg-natural-olive text-white text-[10px] font-bold py-1.5 px-3 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
+                        className="bg-natural-green hover:bg-natural-olive text-white text-[10px] font-bold py-1.5 px-2.5 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
                       >
-                        <Plus className="w-3.5 h-3.5" /> اختيار من متعدد ({defaultMcqPoints} نقاط)
+                        <Plus className="w-3.5 h-3.5" /> اختيار من متعدد ({defaultMcqPoints} ن)
                       </button>
                       <button
                         type="button"
                         onClick={() => handleAddQuestion("boolean")}
-                        className="bg-natural-olive hover:bg-natural-green text-white text-[10px] font-bold py-1.5 px-3 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
+                        className="bg-natural-olive hover:bg-natural-green text-white text-[10px] font-bold py-1.5 px-2.5 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
                       >
-                        <Plus className="w-3.5 h-3.5" /> صح / خطأ ({defaultTrueFalsePoints} نقاط)
+                        <Plus className="w-3.5 h-3.5" /> صح / خطأ ({defaultTrueFalsePoints} ن)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAddQuestion("fill_in_the_blank")}
+                        className="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-bold py-1.5 px-2.5 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> أكمل الفراغ ({defaultFillBlankPoints} ن)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAddQuestion("quote")}
+                        className="bg-purple-600 hover:bg-purple-700 text-white text-[10px] font-bold py-1.5 px-2.5 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> من القائل ({defaultQuotePoints} ن)
                       </button>
                       <button
                         type="button"
                         onClick={() => handleAddQuestion("essay")}
-                        className="bg-natural-accent hover:bg-orange-600 text-white text-[10px] font-bold py-1.5 px-3 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
+                        className="bg-natural-accent hover:bg-orange-600 text-white text-[10px] font-bold py-1.5 px-2.5 rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
                       >
-                        <Plus className="w-3.5 h-3.5" /> سؤال مقالي ({defaultEssayPoints} نقاط)
+                        <Plus className="w-3.5 h-3.5" /> سؤال مقالي ({defaultEssayPoints} ن)
                       </button>
                     </div>
                   </div>
@@ -2057,165 +2159,198 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         لم يتم إضافة أي أسئلة بعد. اضغط على أزرار الإضافة بالأعلى للبدء في صياغة الأسئلة!
                       </div>
                     ) : (
-                      newQuizQuestions.map((q, qIdx) => (
-                        <div key={q.id} className="p-4 bg-white border border-natural-border rounded-xl space-y-3 relative shadow-xs">
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveQuestion(qIdx)}
-                            className="absolute left-2 top-2 text-red-500 hover:text-red-700 cursor-pointer"
-                            title="حذف السؤال"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                      newQuizQuestions.map((q, qIdx) => {
+                        const defPts = q.type === "choice"
+                          ? defaultMcqPoints
+                          : q.type === "boolean"
+                            ? defaultTrueFalsePoints
+                            : q.type === "fill_in_the_blank"
+                              ? defaultFillBlankPoints
+                              : q.type === "quote"
+                                ? defaultQuotePoints
+                                : defaultEssayPoints;
 
-                          <div className="flex items-center gap-1.5 border-b border-natural-border pb-1.5">
-                            <span className="text-[10px] font-black bg-natural-green/10 text-natural-green px-2 py-0.5 rounded-md">
-                              س {qIdx + 1}
-                            </span>
-                            <span className="text-[10px] font-bold text-natural-muted">
-                              {q.type === "choice" ? "سؤال اختيار من متعدد" : q.type === "boolean" ? "سؤال صح أم خطأ" : "سؤال مقالي (تقييم تلقائي)"}
-                            </span>
-                          </div>
+                        return (
+                          <div key={q.id} className="p-4 bg-white border border-natural-border rounded-xl space-y-3 relative shadow-xs">
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveQuestion(qIdx)}
+                              className="absolute left-2 top-2 text-red-500 hover:text-red-700 cursor-pointer"
+                              title="حذف السؤال"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
 
-                          <div className="space-y-2">
-                            <div>
-                              <label className="block text-[9px] font-bold text-natural-green mb-1">نص السؤال الروحي:</label>
-                              <input
-                                type="text"
-                                required
-                                placeholder="اكتب السؤال بوضوح هنا..."
-                                value={q.questionText}
-                                onChange={(e) => handleUpdateQuestion(qIdx, "questionText", e.target.value)}
-                                className="w-full text-xs p-2 rounded-lg border border-natural-border bg-white outline-hidden focus:border-natural-green font-semibold"
-                              />
+                            <div className="flex items-center gap-2 border-b border-natural-border pb-1.5 flex-wrap">
+                              <span className="text-[10px] font-black bg-natural-green/10 text-natural-green px-2 py-0.5 rounded-md">
+                                س {qIdx + 1}
+                              </span>
+                              <div className="flex items-center gap-1">
+                                <span className="text-[10px] font-bold text-natural-muted">نوع السؤال:</span>
+                                <select
+                                  value={q.type}
+                                  onChange={(e) => handleUpdateQuestionType(qIdx, e.target.value as QuestionType)}
+                                  className="text-xs font-bold p-1 rounded-lg border border-natural-border bg-white text-natural-green outline-hidden cursor-pointer"
+                                >
+                                  <option value="choice">اختيار من متعدد (MCQ)</option>
+                                  <option value="boolean">صح أم خطأ (True/False)</option>
+                                  <option value="fill_in_the_blank">أكمل الفراغ (Fill in Blank)</option>
+                                  <option value="quote">من القائل (Quote)</option>
+                                  <option value="essay">سؤال مقالي (Essay)</option>
+                                </select>
+                              </div>
                             </div>
 
-                            {/* Type choice options */}
-                            {q.type === "choice" && (
-                              <div className="space-y-1.5 border-r-2 border-natural-accent/30 pr-3 my-2">
-                                <span className="block text-[9px] font-bold text-natural-green">الاختيارات الأربعة لتختار منها:</span>
-                                {q.options.map((opt: string, optIdx: number) => (
-                                  <div key={optIdx} className="flex items-center gap-2">
-                                    <span className="text-[10px] font-mono text-natural-muted">{optIdx + 1}.</span>
-                                    <input
-                                      type="text"
-                                      required
-                                      placeholder={`الخيار رقم ${optIdx + 1}`}
-                                      value={opt}
-                                      onChange={(e) => handleUpdateOption(qIdx, optIdx, e.target.value)}
-                                      className="flex-1 text-xs p-1.5 rounded-lg border border-natural-border outline-hidden focus:border-natural-green font-semibold"
-                                    />
+                            <div className="space-y-2">
+                              <div>
+                                <label className="block text-[9px] font-bold text-natural-green mb-1">نص السؤال الروحي:</label>
+                                <input
+                                  type="text"
+                                  required
+                                  placeholder="اكتب السؤال بوضوح هنا..."
+                                  value={q.questionText}
+                                  onChange={(e) => handleUpdateQuestion(qIdx, "questionText", e.target.value)}
+                                  className="w-full text-xs p-2 rounded-lg border border-natural-border bg-white outline-hidden focus:border-natural-green font-semibold"
+                                />
+                              </div>
+
+                              {/* Type choice options */}
+                              {q.type === "choice" && (
+                                <div className="space-y-1.5 border-r-2 border-natural-accent/30 pr-3 my-2">
+                                  <span className="block text-[9px] font-bold text-natural-green">الاختيارات الأربعة لتختار منها:</span>
+                                  {q.options.map((opt: string, optIdx: number) => (
+                                    <div key={optIdx} className="flex items-center gap-2">
+                                      <span className="text-[10px] font-mono text-natural-muted">{optIdx + 1}.</span>
+                                      <input
+                                        type="text"
+                                        required
+                                        placeholder={`الخيار رقم ${optIdx + 1}`}
+                                        value={opt}
+                                        onChange={(e) => handleUpdateOption(qIdx, optIdx, e.target.value)}
+                                        className="flex-1 text-xs p-1.5 rounded-lg border border-natural-border outline-hidden focus:border-natural-green font-semibold"
+                                      />
+                                    </div>
+                                  ))}
+                                  <div className="pt-1.5">
+                                    <label className="block text-[9px] font-bold text-natural-green mb-1">حدد الإجابة الصحيحة (أو اتركها لمفتاح مؤجل):</label>
+                                    <select
+                                      value={q.correctAnswer || ""}
+                                      onChange={(e) => handleUpdateQuestion(qIdx, "correctAnswer", e.target.value)}
+                                      className="text-xs p-1.5 rounded-lg border border-natural-border w-full outline-hidden"
+                                    >
+                                      <option value="">-- تأجيل تحديد الإجابة الصحيحة (مفتاح مؤجل) --</option>
+                                      {q.options.map((opt: string, optIdx: number) => (
+                                        <option key={optIdx} value={optIdx.toString()}>
+                                          {opt.trim() ? opt : `الخيار رقم ${optIdx + 1}`}
+                                        </option>
+                                      ))}
+                                    </select>
                                   </div>
-                                ))}
-                                <div className="pt-1.5">
-                                  <label className="block text-[9px] font-bold text-natural-green mb-1">حدد الإجابة الصحيحة:</label>
+                                </div>
+                              )}
+
+                              {/* Type boolean correct choice */}
+                              {q.type === "boolean" && (
+                                <div className="space-y-1.5">
+                                  <label className="block text-[9px] font-bold text-natural-green">حدد الإجابة الصحيحة:</label>
                                   <select
                                     value={q.correctAnswer}
-                                    required
                                     onChange={(e) => handleUpdateQuestion(qIdx, "correctAnswer", e.target.value)}
                                     className="text-xs p-1.5 rounded-lg border border-natural-border w-full outline-hidden"
                                   >
-                                    <option value="">-- اختر الإجابة الصحيحة --</option>
-                                    {q.options.map((opt: string, optIdx: number) => (
-                                      <option key={optIdx} value={optIdx.toString()}>
-                                        {opt.trim() ? opt : `الخيار رقم ${optIdx + 1}`}
-                                      </option>
-                                    ))}
+                                    <option value="true">صح (True)</option>
+                                    <option value="false">خطأ (False)</option>
                                   </select>
                                 </div>
-                              </div>
-                            )}
+                              )}
 
-                            {/* Type boolean correct choice */}
-                            {q.type === "boolean" && (
-                              <div className="space-y-1.5">
-                                <label className="block text-[9px] font-bold text-natural-green">حدد الإجابة الصحيحة:</label>
-                                <select
-                                  value={q.correctAnswer}
-                                  onChange={(e) => handleUpdateQuestion(qIdx, "correctAnswer", e.target.value)}
-                                  className="text-xs p-1.5 rounded-lg border border-natural-border w-full outline-hidden"
-                                >
-                                  <option value="true">صح (True)</option>
-                                  <option value="false">خطأ (False)</option>
-                                </select>
-                              </div>
-                            )}
-
-                            {/* Type essay correct description & rubric */}
-                            {q.type === "essay" && (
-                              <div className="space-y-2">
-                                <div>
-                                  <label className="block text-[9px] font-bold text-natural-green mb-1">الإجابة النموذجية الصحيحة (للمراجعة الذكية):</label>
-                                  <textarea
-                                    rows={2}
-                                    required
-                                    placeholder="اكتب الإجابة النموذجية بالتفصيل لكي يتمكن المصحح التلقائي من قياس إجابات الشاب وتصحيحها بدقة..."
-                                    value={q.correctAnswer}
-                                    onChange={(e) => handleUpdateQuestion(qIdx, "correctAnswer", e.target.value)}
-                                    className="w-full text-xs p-2 rounded-lg border border-natural-border bg-white outline-hidden focus:border-natural-green font-semibold"
-                                  />
+                              {/* Type essay / fill_in_the_blank / quote correct description & rubric */}
+                              {(q.type === "essay" || q.type === "fill_in_the_blank" || q.type === "quote") && (
+                                <div className="space-y-2">
+                                  <div>
+                                    <label className="block text-[9px] font-bold text-natural-green mb-1">
+                                      {q.type === "fill_in_the_blank"
+                                        ? "نموذج الإجابة الصحيحة لإكمال الفراغ (اختياري - مراجعة يدوية):"
+                                        : q.type === "quote"
+                                        ? "نموذج إسناد القول والسياق (اختياري - مراجعة يدوية):"
+                                        : "الإجابة النموذجية الصحيحة (للمراجعة الذكية):"}
+                                    </label>
+                                    <textarea
+                                      rows={2}
+                                      required={q.type === "essay"}
+                                      placeholder={
+                                        q.type === "fill_in_the_blank"
+                                          ? "اكتب الكلمة أو العبارة المتوقعة..."
+                                          : q.type === "quote"
+                                          ? "اكتب القائل وسياق أو مناسبة العبارة..."
+                                          : "اكتب الإجابة النموذجية بالتفصيل لكي يتمكن المصحح من قياس إجابات الشاب وتصحيحها بدقة..."
+                                      }
+                                      value={q.correctAnswer || ""}
+                                      onChange={(e) => handleUpdateQuestion(qIdx, "correctAnswer", e.target.value)}
+                                      className="w-full text-xs p-2 rounded-lg border border-natural-border bg-white outline-hidden focus:border-natural-green font-semibold"
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="block text-[9px] font-bold text-natural-green mb-1 flex items-center justify-between">
+                                      <span>معايير التقييم الإلزامية (Rubric Points) - ضع كل معيار إلزامي في سطر:</span>
+                                      <span className="text-natural-muted font-normal text-[8px]">(اختياري: يقسم النقاط بالتساوي وبصرامة)</span>
+                                    </label>
+                                    <textarea
+                                      rows={2}
+                                      placeholder="- المعيار الأول الإلزامي&#10;- المعيار الثاني الإلزامي&#10;(إذا تركتها فارغة، ستُستخرج تلقائياً من الإجابة النموذجية)"
+                                      value={Array.isArray(q.rubricPoints) ? q.rubricPoints.join("\n") : (q.rubricPoints || "")}
+                                      onChange={(e) => {
+                                        const lines = e.target.value.split("\n").map(s => s.trim().replace(/^[\s*•\-–—✔▪▫]+/, "")).filter(Boolean);
+                                        handleUpdateQuestion(qIdx, "rubricPoints", lines);
+                                      }}
+                                      className="w-full text-xs p-2 rounded-lg border border-natural-border bg-slate-50 outline-hidden focus:border-natural-green font-mono"
+                                    />
+                                  </div>
                                 </div>
-                                <div>
-                                  <label className="block text-[9px] font-bold text-natural-green mb-1 flex items-center justify-between">
-                                    <span>معايير التقييم الإلزامية (Rubric Points) - ضع كل معيار إلزامي في سطر:</span>
-                                    <span className="text-natural-muted font-normal text-[8px]">(اختياري: يقسم النقاط بالتساوي وبصرامة)</span>
-                                  </label>
-                                  <textarea
-                                    rows={2}
-                                    placeholder="- المعيار الأول الإلزامي&#10;- المعيار الثاني الإلزامي&#10;(إذا تركتها فارغة، ستُستخرج تلقائياً من الإجابة النموذجية)"
-                                    value={Array.isArray(q.rubricPoints) ? q.rubricPoints.join("\n") : (q.rubricPoints || "")}
-                                    onChange={(e) => {
-                                      const lines = e.target.value.split("\n").map(s => s.trim().replace(/^[\s*•\-–—✔▪▫]+/, "")).filter(Boolean);
-                                      handleUpdateQuestion(qIdx, "rubricPoints", lines);
-                                    }}
-                                    className="w-full text-xs p-2 rounded-lg border border-natural-border bg-slate-50 outline-hidden focus:border-natural-green font-mono"
-                                  />
-                                </div>
-                              </div>
-                            )}
+                              )}
 
-                            <div className="w-48 bg-slate-50 p-2 rounded-lg border border-natural-border/70">
-                              <div className="flex items-center justify-between mb-1">
-                                <label className="block text-[9px] font-bold text-natural-green">نقاط السؤال:</label>
-                                {q.isCustomPoints ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      const defPts = q.type === "choice" ? defaultMcqPoints : q.type === "boolean" ? defaultTrueFalsePoints : defaultEssayPoints;
-                                      handleUpdateQuestion(qIdx, "points", defPts);
-                                      handleUpdateQuestion(qIdx, "isCustomPoints", false);
-                                    }}
-                                    className="text-[9px] font-bold text-amber-600 hover:text-amber-800 underline cursor-pointer"
-                                    title="إعادة احتساب الدرجة بحسب التوزيع الافتراضي"
-                                  >
-                                    مخصصة ✏️ (إعادة)
-                                  </button>
-                                ) : (
-                                  <span className="text-[9px] text-natural-muted font-bold">
-                                    تلقائية ({q.type === "choice" ? defaultMcqPoints : q.type === "boolean" ? defaultTrueFalsePoints : defaultEssayPoints})
-                                  </span>
-                                )}
+                              <div className="w-48 bg-slate-50 p-2 rounded-lg border border-natural-border/70">
+                                <div className="flex items-center justify-between mb-1">
+                                  <label className="block text-[9px] font-bold text-natural-green">نقاط السؤال:</label>
+                                  {q.isCustomPoints ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        handleUpdateQuestion(qIdx, "points", defPts);
+                                        handleUpdateQuestion(qIdx, "isCustomPoints", false);
+                                      }}
+                                      className="text-[9px] font-bold text-amber-600 hover:text-amber-800 underline cursor-pointer"
+                                      title="إعادة احتساب الدرجة بحسب التوزيع الافتراضي"
+                                    >
+                                      مخصصة ✏️ (إعادة)
+                                    </button>
+                                  ) : (
+                                    <span className="text-[9px] text-natural-muted font-bold">
+                                      تلقائية ({defPts})
+                                    </span>
+                                  )}
+                                </div>
+                                <input
+                                  type="number"
+                                  required
+                                  min={1}
+                                  value={q.points}
+                                  onChange={(e) => {
+                                    const val = parseInt(e.target.value, 10) || 1;
+                                    handleUpdateQuestion(qIdx, "points", val);
+                                    handleUpdateQuestion(qIdx, "isCustomPoints", true);
+                                  }}
+                                  className={`w-full text-xs p-1 rounded-md border font-black text-center outline-hidden ${
+                                    q.isCustomPoints
+                                      ? "bg-amber-50 border-amber-300 text-amber-900"
+                                      : "bg-white border-natural-border text-natural-green"
+                                  }`}
+                                />
                               </div>
-                              <input
-                                type="number"
-                                required
-                                min={1}
-                                value={q.points}
-                                onChange={(e) => {
-                                  const val = parseInt(e.target.value, 10) || 1;
-                                  handleUpdateQuestion(qIdx, "points", val);
-                                  handleUpdateQuestion(qIdx, "isCustomPoints", true);
-                                }}
-                                className={`w-full text-xs p-1 rounded-md border font-black text-center outline-hidden ${
-                                  q.isCustomPoints
-                                    ? "bg-amber-50 border-amber-300 text-amber-900"
-                                    : "bg-white border-natural-border text-natural-green"
-                                }`}
-                              />
                             </div>
                           </div>
-                        </div>
-                      ))
+                        );
+                      })
                     )}
                   </div>
 
@@ -2293,6 +2428,18 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                           </div>
 
                           <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                            {quiz.questions?.some(q => (q.type === "choice" || q.type === "boolean" || (q.type as string) === "mcq" || (q.type as string) === "true_false") && (!q.correctAnswer || !q.correctAnswer.trim() || q.correctAnswer === "-1")) && (
+                              <button
+                                type="button"
+                                onClick={() => setPostGradingQuiz(quiz)}
+                                className="text-[10px] font-black text-amber-900 bg-amber-100 hover:bg-amber-200 border border-amber-300 px-2.5 py-1 rounded-lg transition-colors cursor-pointer flex items-center gap-1 shadow-2xs animate-pulse"
+                                title="إرفاق نموذج الإجابة وتصحيح التسليمات المعلقة تلقائياً"
+                              >
+                                <FileText className="w-3 h-3 text-amber-700" />
+                                إرفاق نموذج الإجابة 📝
+                              </button>
+                            )}
+
                             <button
                               type="button"
                               onClick={() => {
@@ -3481,20 +3628,20 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                           
                           {q.type === "choice" && (
                             <p className="text-[10px] text-natural-muted">
-                              💡 الإجابة الصحيحة: {q.options[parseInt(q.correctAnswer, 10)]}
+                              💡 الإجابة الصحيحة: {q.correctAnswer !== undefined && q.correctAnswer !== null && q.correctAnswer !== "" ? q.options?.[parseInt(q.correctAnswer, 10)] : "مفتاح الإجابة مؤجل (بانتظار التحديد من المشرف)"}
                             </p>
                           )}
                           {q.type === "boolean" && (
                             <p className="text-[10px] text-natural-muted">
-                              💡 الإجابة الصحيحة: {q.correctAnswer === "true" ? "صح" : "خطأ"}
+                              💡 الإجابة الصحيحة: {q.correctAnswer === "true" ? "صح" : q.correctAnswer === "false" ? "خطأ" : "مفتاح الإجابة مؤجل"}
                             </p>
                           )}
-                          {q.type === "essay" && (
+                          {(q.type === "essay" || q.type === "fill_in_the_blank" || q.type === "quote") && (
                             <div className="space-y-3 pt-1">
                               {/* Stored Model Answer as Admin Reference */}
                               <div className="p-3 bg-amber-50/80 dark:bg-amber-950/40 rounded-xl border border-amber-200 dark:border-amber-800/60 text-right space-y-1">
                                 <span className="text-[11px] font-black text-amber-900 dark:text-amber-300 block">
-                                  💡 نموذج الإجابة الإسترشادي للمشرف:
+                                  💡 {q.type === "fill_in_the_blank" ? "نموذج إكمال الفراغ الإسترشادي:" : q.type === "quote" ? "نموذج إسناد القول الإسترشادي:" : "نموذج الإجابة الإسترشادي للمشرف:"}
                                 </span>
                                 <p className="text-xs font-bold text-amber-950 dark:text-amber-100 leading-relaxed">
                                   {q.modelAnswer || q.correctAnswer || "لا يوجد نموذج محدد لهذا السؤال."}
@@ -3504,7 +3651,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                               {!isStarted && (
                                 <div className="bg-white dark:bg-slate-900 p-3.5 rounded-xl border border-natural-border/80 space-y-3 text-right">
                                   <p className="text-xs font-extrabold text-natural-green flex items-center gap-1">
-                                    📝 التصحيح اليدوي للسؤال المقالي (من {q.points} نقطة):
+                                    📝 التصحيح اليدوي للسؤال (من {q.points} نقطة):
                                   </p>
                                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                                     <div className="sm:col-span-1">
@@ -3554,7 +3701,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             </div>
                           )}
 
-                          {!isStarted && q.type !== "essay" && result.feedback ? (
+                          {!isStarted && q.type !== "essay" && q.type !== "fill_in_the_blank" && q.type !== "quote" && result.feedback ? (
                             <div className="mt-2 bg-white/80 p-2 rounded-lg border border-natural-border/40 text-[11px] font-bold text-natural-green/95 text-right">
                               📝 تقييم الإجابة:
                               <p className="font-medium text-natural-text/90 mt-1 pr-1.5 leading-relaxed font-bold">{result.feedback}</p>
@@ -3997,6 +4144,22 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
           defaultMcqPoints={defaultMcqPoints}
           defaultTrueFalsePoints={defaultTrueFalsePoints}
           defaultEssayPoints={defaultEssayPoints}
+        />,
+        document.body
+      )}
+
+      {/* Post-Grading Answer Key Modal (Phase 6.2) */}
+      {postGradingQuiz && createPortal(
+        <PostGradingModal
+          isOpen={!!postGradingQuiz}
+          onClose={() => setPostGradingQuiz(null)}
+          quiz={postGradingQuiz}
+          quizzes={state?.quizzes || []}
+          onGraded={(updatedDb, msg) => {
+            onUpdateState(updatedDb);
+            setSuccess(msg);
+            setPostGradingQuiz(null);
+          }}
         />,
         document.body
       )}

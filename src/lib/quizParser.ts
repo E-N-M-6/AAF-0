@@ -5,15 +5,17 @@
  * via multiple notation formats (summary lines, inline asterisks, inline indicators).
  */
 
+import { QuestionType } from "../types";
+
 export interface ParsedQuestionDraft {
   id: string;
-  type: "choice" | "boolean" | "essay";
+  type: QuestionType;
   questionText: string;
   options: [string, string, string, string]; // for choice
-  correctAnswer: string; // "0"|"1"|"2"|"3" for choice, "true"|"false" for boolean, model answer for essay
+  correctAnswer?: string; // "0"|"1"|"2"|"3" for choice, "true"|"false" for boolean, model answer for essay/quote/fill_in_the_blank, or undefined for delayed key
   points: number;
   isCustomPoints?: boolean;
-  modelAnswer?: string; // for essay
+  modelAnswer?: string; // for essay, fill_in_the_blank, quote
   warnings?: string[];
 }
 
@@ -23,6 +25,8 @@ export interface ParseResult {
   mcqCount: number;
   trueFalseCount: number;
   essayCount: number;
+  fillBlankCount: number;
+  quoteCount: number;
   unparsedLines: string[];
   warnings: string[];
 }
@@ -59,11 +63,17 @@ const SUMMARY_ANSWER_REGEX = /^(?:(?:الإجابة|الاجابة|الجواب|
 // e.g.: "نموذج الإجابة: ...", "الإجابة النموذجية: ...", "Model Answer: ..."
 const ESSAY_ANSWER_REGEX = /^(?:(?:نموذج\s+الإجابة|الإجابة\s+النموذجية|الاجابة\s+النموذجية|نموذج\s+الحل|عناصر\s+الإجابة|Model\s+Answer))\s*[:=]\s*(.+)$/i;
 
+// Detect Fill in the blank ("أكمل:") and Quote ("من القائل:" or "من قال هذه العبارة:")
+export const FILL_BLANK_REGEX = /(?:(?:^|\s)(?:\d+[\.\-\)]\s*)?(?:أكمل|اكمل)\s*[:\.\-]?\s*|(?:^|\s)(?:\d+[\.\-\)]\s*)?(?:أكمل|اكمل)\s+(?:الفراغ|الفراغات|العبارة|العبارات|الجملة|الجمل|ما\s*يأتي|ما\s*يلي)\s*[:\.\-]?\s*)/i;
+export const QUOTE_REGEX = /(?:(?:^|\s)(?:\d+[\.\-\)]\s*)?(?:من\s+قائل|من\s+قال|من\s+القائل)(?:\s+هذه\s+العبارة)?\s*[:\.\-]?\s*)/i;
+
 // Section dividers & headers regex to filter out or detect section shifts
 const SECTION_DIVIDER_REGEX = /^(?:[-=_*~]{3,}|\s*[-=_*~]{3,}.*?[-=_*~]{3,}\s*)$/;
 const ESSAY_SECTION_HEADER_REGEX = /(?:الأسئلة\s+المقالية|القسم\s+المقالي|أسئلة\s+مقالية|مقالي|Essay\s+Questions)/i;
 const TRUE_FALSE_SECTION_HEADER_REGEX = /(?:أسئلة\s+الصواب\s+والخطأ|صح\s+أم\s+خطأ|صح\s+وخطأ|صواب\s+أم\s+خطأ|True\s*[\/\-]?\s*False)/i;
 const MCQ_SECTION_HEADER_REGEX = /(?:الاختيار\s+من\s+متعدد|اختيار\s+من\s+متعدد|أسئلة\s+الاختيارات|Multiple\s+Choice)/i;
+const FILL_BLANK_SECTION_HEADER_REGEX = /(?:أسئلة\s+أكمل|أكمل\s+الفراغ|أكمل\s+العبارات|ملء\s+الفراغ|Fill\s+in\s+the\s+blank)/i;
+const QUOTE_SECTION_HEADER_REGEX = /(?:أسئلة\s+من\s+القائل|من\s+القائل|من\s+قال\s+هذه\s+العبارة|أقوال\s+الآباء|Quotes?)/i;
 const DECORATIVE_HEADER_REGEX = /^(?:(?:أول[اً|ا]|ثاني[اً|ا]|ثالث[اً|ا]|رابع[اً|ا]|خامس[اً|ا])\s*[:\.\-]|المراجع\s+الكتابية\s*[:\.\-]|ملاحظات\s*[:\.\-]|تعليمات\s*[:\.\-]|تنبيه\s*[:\.\-]|Section\s+\w+|Part\s+\w+)/i;
 
 /**
@@ -187,7 +197,7 @@ function expandInlineOptions(lines: string[]): string[] {
 }
 
 interface RawQuestionBlock {
-  sectionTypeHint: "choice" | "boolean" | "essay";
+  sectionTypeHint: QuestionType;
   questionTextLines: string[];
   options: { [key: number]: string };
   correctIndex: string;
@@ -203,7 +213,9 @@ export function parseBulkQuizText(
   rawText: string,
   defaultMcqPoints: number = 2,
   defaultTrueFalsePoints: number = 1,
-  defaultEssayPoints: number = 5
+  defaultEssayPoints: number = 5,
+  defaultFillBlankPoints: number = 3,
+  defaultQuotePoints: number = 4
 ): ParseResult {
   const normalized = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const rawLines = normalized.split("\n");
@@ -216,7 +228,7 @@ export function parseBulkQuizText(
   const blocks: RawQuestionBlock[] = [];
   let currentBlock: RawQuestionBlock | null = null;
   let currentOptionSlot: number | null = null;
-  let currentSectionType: "choice" | "boolean" | "essay" = "choice";
+  let currentSectionType: QuestionType = "choice";
 
   const commitCurrentBlock = () => {
     if (currentBlock) {
@@ -234,12 +246,9 @@ export function parseBulkQuizText(
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) {
-      // If we already have 4 options or model answer in current block, empty line can mark end of question
+      // Empty line marks completion of current question block
       if (currentBlock) {
-        const optCount = Object.keys(currentBlock.options).length;
-        if (optCount >= 4 || currentBlock.modelAnswer || currentBlock.sectionTypeHint === "essay") {
-          commitCurrentBlock();
-        }
+        commitCurrentBlock();
       }
       continue;
     }
@@ -259,6 +268,16 @@ export function parseBulkQuizText(
       if (MCQ_SECTION_HEADER_REGEX.test(line)) {
         commitCurrentBlock();
         currentSectionType = "choice";
+        continue;
+      }
+      if (FILL_BLANK_SECTION_HEADER_REGEX.test(line)) {
+        commitCurrentBlock();
+        currentSectionType = "fill_in_the_blank";
+        continue;
+      }
+      if (QUOTE_SECTION_HEADER_REGEX.test(line)) {
+        commitCurrentBlock();
+        currentSectionType = "quote";
         continue;
       }
       // Pure divider line: ignore
@@ -281,17 +300,27 @@ export function parseBulkQuizText(
       currentSectionType = "choice";
       continue;
     }
+    if (FILL_BLANK_SECTION_HEADER_REGEX.test(line) && line.length < 50) {
+      commitCurrentBlock();
+      currentSectionType = "fill_in_the_blank";
+      continue;
+    }
+    if (QUOTE_SECTION_HEADER_REGEX.test(line) && line.length < 50) {
+      commitCurrentBlock();
+      currentSectionType = "quote";
+      continue;
+    }
     if (DECORATIVE_HEADER_REGEX.test(line)) {
       // Decorative instructions / references line: ignore
       continue;
     }
 
-    // 2. Check for explicit essay model answer line: e.g. "نموذج الإجابة: ..."
+    // 2. Check for explicit essay/manual model answer line: e.g. "نموذج الإجابة: ..."
     const essayMatch = line.match(ESSAY_ANSWER_REGEX);
     if (essayMatch) {
       if (!currentBlock) {
         currentBlock = {
-          sectionTypeHint: "essay",
+          sectionTypeHint: currentSectionType === "fill_in_the_blank" || currentSectionType === "quote" ? currentSectionType : "essay",
           questionTextLines: ["سؤال مقالي"],
           options: {},
           correctIndex: "",
@@ -300,7 +329,6 @@ export function parseBulkQuizText(
           rawLines: [line]
         };
       } else {
-        currentBlock.sectionTypeHint = "essay";
         currentBlock.modelAnswer = essayMatch[1].trim();
         currentBlock.rawLines.push(line);
       }
@@ -322,14 +350,25 @@ export function parseBulkQuizText(
       continue;
     }
 
-    // 4. Check if line is a Question Header (e.g. "1. ...", "س1: ...", "السؤال الأول: ...")
+    // 4. Check if line is a Question Header (e.g. "1. ...", "س1: ...", "السؤال الأول: ...", or starts with "أكمل:" / "من القائل:")
     const qMatch = line.match(QUESTION_NUMBER_REGEX);
-    if (qMatch) {
+    const isDirectFillBlank = !qMatch && FILL_BLANK_REGEX.test(line);
+    const isDirectQuote = !qMatch && QUOTE_REGEX.test(line);
+
+    if (qMatch || isDirectFillBlank || isDirectQuote) {
       commitCurrentBlock();
 
+      const rawQText = qMatch ? (qMatch[1] ? qMatch[1].trim() : line) : line;
+      let initialTypeHint = currentSectionType;
+      if (FILL_BLANK_REGEX.test(rawQText) || isDirectFillBlank) {
+        initialTypeHint = "fill_in_the_blank";
+      } else if (QUOTE_REGEX.test(rawQText) || isDirectQuote) {
+        initialTypeHint = "quote";
+      }
+
       currentBlock = {
-        sectionTypeHint: currentSectionType,
-        questionTextLines: [qMatch[1] ? qMatch[1].trim() : line],
+        sectionTypeHint: initialTypeHint,
+        questionTextLines: [rawQText],
         options: {},
         correctIndex: "",
         booleanAnswer: "",
@@ -452,56 +491,77 @@ export function parseBulkQuizText(
     const opt3 = (block.options[3] || "").trim();
     const optionCount = Object.keys(block.options).length;
 
-    // Detect if this question is True / False:
-    // Either section hint is boolean, or option 0 is صح/صواب and option 1 is خطأ
-    const isExplicitTrueFalse =
-      (isTrueValue(opt0) && isFalseValue(opt1)) ||
-      (isFalseValue(opt0) && isTrueValue(opt1)) ||
-      (block.sectionTypeHint === "boolean" && optionCount <= 2);
-
-    // Detect if this question is Essay:
-    // Either section hint is essay, or has model answer, or 0 options in essay context
-    const isEssay = block.sectionTypeHint === "essay" || Boolean(block.modelAnswer.trim()) || (optionCount === 0 && block.sectionTypeHint !== "boolean");
-
-    let questionType: "choice" | "boolean" | "essay" = "choice";
+    let questionType: QuestionType = "choice";
     let finalCorrectAnswer = "";
     let finalPoints = defaultMcqPoints;
     const warnings: string[] = [];
 
-    if (isEssay) {
-      questionType = "essay";
-      finalPoints = defaultEssayPoints;
-      finalCorrectAnswer = block.modelAnswer.trim() || block.correctIndex;
-      if (!finalCorrectAnswer) {
-        warnings.push("يرجى كتابة نموذج الإجابة للمراجعة والتقييم الذكي.");
-      }
-    } else if (isExplicitTrueFalse) {
-      questionType = "boolean";
-      finalPoints = defaultTrueFalsePoints;
+    // STRICT ISOLATION CLASSIFICATION LOGIC:
+    // 1. If question has 2 or more options, it is an option-based question (True/False or MCQ Choice).
+    if (optionCount >= 2) {
+      const isExplicitTrueFalse =
+        (isTrueValue(opt0) && isFalseValue(opt1)) ||
+        (isFalseValue(opt0) && isTrueValue(opt1)) ||
+        (block.sectionTypeHint === "boolean" && optionCount <= 2);
 
-      // Determine true or false answer
-      if (block.booleanAnswer) {
-        finalCorrectAnswer = block.booleanAnswer;
-      } else if (block.correctIndex === "0") {
-        finalCorrectAnswer = isTrueValue(opt0) ? "true" : "false";
-      } else if (block.correctIndex === "1") {
-        finalCorrectAnswer = isFalseValue(opt1) ? "false" : "true";
+      if (isExplicitTrueFalse) {
+        questionType = "boolean";
+        finalPoints = defaultTrueFalsePoints;
+        if (block.booleanAnswer) {
+          finalCorrectAnswer = block.booleanAnswer;
+        } else if (block.correctIndex === "0") {
+          finalCorrectAnswer = isTrueValue(opt0) ? "true" : "false";
+        } else if (block.correctIndex === "1") {
+          finalCorrectAnswer = isFalseValue(opt1) ? "false" : "true";
+        } else {
+          warnings.push("مفتاح صح/خطأ مؤجل (يمكنك تحديده من المعاينة).");
+        }
       } else {
-        warnings.push("يرجى تحديد ما إذا كانت الإجابة صح أم خطأ.");
+        // Standard MCQ Choice
+        questionType = "choice";
+        finalPoints = defaultMcqPoints;
+        finalCorrectAnswer = block.correctIndex || ""; // Empty string triggers pending_auto_grade if un-keyed!
+
+        if (!opt0 || !opt1 || !opt2 || !opt3) {
+          const missingCount = [opt0, opt1, opt2, opt3].filter((o) => !o).length;
+          warnings.push(`تم رصد ${4 - missingCount} خيارات فقط من أصل 4.`);
+        }
+
+        if (!finalCorrectAnswer) {
+          warnings.push("مفتاح مؤجل: لم يتم تحديد إجابة صحيحة (*) - سيتم تأجيل التصحيح حتى اعتماد المفتاح لاحقاً.");
+        }
       }
     } else {
-      // Standard Multiple Choice Question
-      questionType = "choice";
-      finalPoints = defaultMcqPoints;
-      finalCorrectAnswer = block.correctIndex;
-
-      if (!opt0 || !opt1 || !opt2 || !opt3) {
-        const missingCount = [opt0, opt1, opt2, opt3].filter((o) => !o).length;
-        warnings.push(`تم رصد ${4 - missingCount} خيارات فقط من أصل 4.`);
-      }
-
-      if (!finalCorrectAnswer) {
-        warnings.push("لم يتم تحديد الإجابة الصحيحة تلقائياً (يرجى اختيارها من المعاينة).");
+      // 2. No choice options provided (optionCount < 2): Text questions (fill_in_the_blank, quote, essay)
+      if (block.sectionTypeHint === "fill_in_the_blank" || FILL_BLANK_REGEX.test(questionText)) {
+        questionType = "fill_in_the_blank";
+        finalPoints = defaultFillBlankPoints;
+        finalCorrectAnswer = block.modelAnswer.trim() || block.correctIndex || "";
+        questionText = questionText.replace(FILL_BLANK_REGEX, "").replace(QUESTION_NUMBER_REGEX, "$1").trim();
+        if (!questionText) {
+          questionText = block.questionTextLines.join(" ").trim().replace(QUESTION_NUMBER_REGEX, "$1").trim() || `سؤال رقم ${bIdx + 1}`;
+        }
+        if (!finalCorrectAnswer) {
+          warnings.push("سؤال أكمل الفراغ (مراجعة يدوية). يمكن ترك نموذج الإجابة أو كتابة الكلمة الصحيحة كمرجع.");
+        }
+      } else if (block.sectionTypeHint === "quote" || QUOTE_REGEX.test(questionText)) {
+        questionType = "quote";
+        finalPoints = defaultQuotePoints;
+        finalCorrectAnswer = block.modelAnswer.trim() || block.correctIndex || "";
+        questionText = questionText.replace(QUOTE_REGEX, "").replace(QUESTION_NUMBER_REGEX, "$1").trim();
+        if (!questionText) {
+          questionText = block.questionTextLines.join(" ").trim().replace(QUESTION_NUMBER_REGEX, "$1").trim() || `سؤال رقم ${bIdx + 1}`;
+        }
+        if (!finalCorrectAnswer) {
+          warnings.push("سؤال من القائل (مراجعة يدوية). يمكن ترك نموذج الإجابة أو كتابة القائل كمرجع.");
+        }
+      } else {
+        questionType = "essay";
+        finalPoints = defaultEssayPoints;
+        finalCorrectAnswer = block.modelAnswer.trim() || block.correctIndex || "";
+        if (!finalCorrectAnswer) {
+          warnings.push("يرجى كتابة نموذج الإجابة للمراجعة والتقييم الذكي.");
+        }
       }
     }
 
@@ -521,6 +581,8 @@ export function parseBulkQuizText(
   const mcqCount = parsedQuestions.filter((q) => q.type === "choice").length;
   const trueFalseCount = parsedQuestions.filter((q) => q.type === "boolean").length;
   const essayCount = parsedQuestions.filter((q) => q.type === "essay").length;
+  const fillBlankCount = parsedQuestions.filter((q) => q.type === "fill_in_the_blank").length;
+  const quoteCount = parsedQuestions.filter((q) => q.type === "quote").length;
 
   return {
     questions: parsedQuestions,
@@ -528,6 +590,8 @@ export function parseBulkQuizText(
     mcqCount,
     trueFalseCount,
     essayCount,
+    fillBlankCount,
+    quoteCount,
     unparsedLines,
     warnings: globalWarnings
   };
@@ -645,4 +709,12 @@ Correct Answer: A
 نموذج الإجابة: أقيم الفصح والعشاء السري في علية بيته، وهو الشاب الذي تبع المسيح متلففاً بإزار ليلة القبض عليه في بستان جثسيماني وتركه وهرب.
 
 20. كيف انتهت حياة القديس مرقس الرسول ونال إكليل الشهادة بالإسكندرية؟
-الإجابة النموذجية: وثب عليه عبدة الأوثان يوم عيد الفصح القبطي الذي وافق عيد سيرابيس، وجروه في شوارع الإسكندرية بالحبال حتى فاضت روحه ونال إكليل الاستشهاد عام 68م.`;
+الإجابة النموذجية: وثب عليه عبدة الأوثان يوم عيد الفصح القبطي الذي وافق عيد سيرابيس، وجروه في شوارع الإسكندرية بالحبال حتى فاضت روحه ونال إكليل الاستشهاد عام 68م.
+
+--- القسم الرابع: أسئلة أكمل ومن القائل ---
+
+21. أكمل: "صوت صارخ في البرية: أعدوا طريق .....، اصنعوا سبله مستقيمة"
+نموذج الإجابة: الرب
+
+22. من القائل: "يا معلم، أما يهمك أننا نهلك؟"
+نموذج الإجابة: التلاميذ للسيد المسيح في السفينة أثناء العاصفة.`;

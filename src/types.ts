@@ -73,13 +73,23 @@ export interface Task {
   verifiedAt?: string;
 }
 
+export type QuestionType = "choice" | "boolean" | "essay" | "fill_in_the_blank" | "quote";
+
+export type QuestionGradingStatus =
+  | "auto_graded"
+  | "admin_approved"
+  | "admin_overridden"
+  | "pending_manual_review"
+  | "pending_auto_grade"
+  | "graded";
+
 export interface QuizQuestion {
   id: string;
-  type: "choice" | "boolean" | "essay";
+  type: QuestionType;
   questionText: string;
   options?: string[]; // array of choice options
-  correctAnswer?: string; // index for choice ("0", "1", etc.), "true"/"false" for boolean, or model answer for essay grading
-  modelAnswer?: string; // stored model answer / reference answer for essay questions as admin guide
+  correctAnswer?: string; // index for choice ("0", "1", etc.), "true"/"false" for boolean, model answer, or undefined for delayed key
+  modelAnswer?: string; // stored model answer / reference answer for essay/quote/fill_in_the_blank questions as admin guide
   rubricPoints?: string[]; // array of mandatory key items required for full credit
   points: number;
   isCustomPoints?: boolean; // manual point override indicator
@@ -122,7 +132,7 @@ export interface QuizQuestionResult {
   missingRubricPoints?: string[];
   gradingReasoning?: string;
   autoGraded?: boolean;
-  status?: string;
+  status?: QuestionGradingStatus | string;
 }
 
 export interface QuizViolationRecord {
@@ -161,7 +171,7 @@ export interface QuizSubmission {
   totalScore: number;
   submittedAt: string;
   gradedAt?: string;
-  status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "VIOLATION_TERMINATED";
+  status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "pending_auto_grade" | "VIOLATION_TERMINATED";
   isManual?: boolean;
   violationCount?: number;
   violations?: QuizViolationRecord[];

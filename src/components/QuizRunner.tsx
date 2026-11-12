@@ -293,9 +293,13 @@ export default function QuizRunner({
         );
 
         if (myScore) {
-          if (myScore.status === "pending_manual_review") {
+          if (myScore.status === "pending_auto_grade") {
             onSuccess(
-              `تم تسليم الكويز بنجاح! أسئلة الاختيارات صُححت فوراً (${myScore.totalScore} نقطة)، والأسئلة المقالية بانتظار مراجعة المشرف. 🎉`
+              `تم تسليم الكويز بنجاح! أسئلة الاختبار بانتظار اعتماد مفتاح الإجابات من المشرف لرصد الدرجة تلقائياً. 🎉`
+            );
+          } else if (myScore.status === "pending_manual_review") {
+            onSuccess(
+              `تم تسليم الكويز بنجاح! أسئلة الاختيارات صُححت فوراً (${myScore.totalScore} نقطة)، والأسئلة المقالية وإكمال الفراغات بانتظار مراجعة المشرف. 🎉`
             );
           } else {
             onSuccess(
@@ -735,6 +739,36 @@ export default function QuizRunner({
                       >
                         خطأ (✕)
                       </button>
+                    </div>
+                  )}
+
+                  {/* Fill in the blank (short input text) */}
+                  {q.type === "fill_in_the_blank" && (
+                    <div className="pt-1">
+                      <input
+                        type="text"
+                        required
+                        placeholder="اكتب إجابتك لإكمال الفراغ هنا..."
+                        value={answers[q.id] || ""}
+                        onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
+                        onPaste={handlePaste}
+                        className="w-full text-xs md:text-sm p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 outline-hidden focus:border-natural-green font-semibold leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-500"
+                      />
+                    </div>
+                  )}
+
+                  {/* Quote attribution (textarea) */}
+                  {q.type === "quote" && (
+                    <div className="pt-1">
+                      <textarea
+                        rows={3}
+                        required
+                        placeholder="اكتب من قال هذه العبارة ومناسبتها أو سياقها هنا..."
+                        value={answers[q.id] || ""}
+                        onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
+                        onPaste={handlePaste}
+                        className="w-full text-xs md:text-sm p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 outline-hidden focus:border-natural-green font-semibold leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-500"
+                      />
                     </div>
                   )}
 

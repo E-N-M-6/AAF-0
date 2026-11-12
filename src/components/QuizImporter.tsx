@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { createPortal } from "react-dom";
 import { 
   X, 
   FileText, 
@@ -228,12 +229,12 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
   const quoteCount = parsedDrafts.filter((q) => q.type === "quote").length;
   const delayedMcqCount = parsedDrafts.filter((q) => q.type === "choice" && (!q.correctAnswer || !q.correctAnswer.trim())).length;
 
-  return (
+  return createPortal(
     <div 
-      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/60 backdrop-blur-xs overflow-y-auto animate-in fade-in duration-200"
+      className="fixed inset-0 z-[9999] w-screen h-screen flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
       dir="rtl"
     >
-      <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 w-full max-w-4xl max-h-[94vh] flex flex-col overflow-hidden my-auto text-slate-900 dark:text-slate-100">
+      <div className="relative w-full max-w-4xl max-h-[90vh] overflow-y-auto bg-white dark:bg-slate-900 rounded-2xl shadow-2xl flex flex-col border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-slate-100">
         {/* Header */}
         <div className="p-4 sm:p-5 bg-gradient-to-r from-emerald-800 via-teal-700 to-natural-green text-white flex items-center justify-between shrink-0 shadow-sm">
           <div className="flex items-center gap-2.5">
@@ -736,7 +737,8 @@ export const QuizImporter: React.FC<QuizImporterProps> = ({
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 };
 

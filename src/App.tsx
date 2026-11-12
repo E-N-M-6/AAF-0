@@ -243,8 +243,22 @@ export default function App() {
     }
   }, [isDarkMode]);
   
-  // Navigation tabs
-  const [activeMenu, setActiveMenu] = useState<"leaderboard" | "dashboard">("leaderboard");
+  // Navigation tabs (persisted in localStorage across page reloads)
+  const [activeMenu, setActiveMenu] = useState<"leaderboard" | "dashboard">(() => {
+    if (typeof window !== "undefined") {
+      const savedTab = localStorage.getItem("lastActiveTab");
+      if (savedTab === "leaderboard" || savedTab === "dashboard") {
+        return savedTab;
+      }
+    }
+    return "leaderboard";
+  });
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("lastActiveTab", activeMenu);
+    }
+  }, [activeMenu]);
   
   // User QR Modal state
   const [isUserQRModalOpen, setIsUserQRModalOpen] = useState(false);

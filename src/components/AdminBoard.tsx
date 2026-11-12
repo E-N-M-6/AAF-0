@@ -72,7 +72,19 @@ function isRawJsonError(text?: string): boolean {
 }
 
 export default function AdminBoard({ state, onUpdateState, setError, setSuccess }: AdminBoardProps) {
-  const [activeTab, setActiveTab] = useState<"attendance" | "tasks_review" | "assign_task" | "manage_users" | "broadcast" | "quizzes" | "confessions" | "bonus_quiz_manual">("attendance");
+  const [activeTab, setActiveTab] = useState<"attendance" | "admin_dashboard" | "tasks_review" | "assign_task" | "manage_users" | "broadcast" | "quizzes" | "confessions" | "bonus_quiz_manual">(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("lastAdminActiveTab");
+      if (saved) return saved as any;
+    }
+    return "attendance";
+  });
+
+  React.useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("lastAdminActiveTab", activeTab);
+    }
+  }, [activeTab]);
   
   // Post-Grading Modal State (Phase 6.2)
   const [postGradingQuiz, setPostGradingQuiz] = useState<Quiz | null>(null);
@@ -1208,24 +1220,6 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
 
   return (
     <div className="space-y-6">
-
-      {/* Admin Board Header with Manual Refresh Submissions Action */}
-      <div className="flex items-center justify-between flex-wrap gap-3 pb-3 border-b border-natural-border">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">🛡️</span>
-          <h2 className="text-sm sm:text-base font-black text-natural-text">لوحة تحكم وإدارة المسابقة</h2>
-        </div>
-        <button
-          type="button"
-          onClick={handleRefreshSubmissions}
-          disabled={isFetchingSubmissions}
-          className="flex items-center gap-2 px-3.5 py-1.5 text-xs font-bold text-natural-green bg-natural-green/10 hover:bg-natural-green/20 border border-natural-green/30 rounded-xl transition-all cursor-pointer shadow-2xs active:scale-95 disabled:opacity-50"
-          title="تحديث وإعادة جلب تسليمات الكويزات بدون إعادة تحميل الصفحة"
-        >
-          <span className={isFetchingSubmissions ? "animate-spin" : ""}>🔄</span>
-          <span>تحديث البيانات 🔄</span>
-        </button>
-      </div>
 
       {/* Tabs */}
       <div className="flex border-b border-natural-border gap-1 overflow-x-auto pb-px">

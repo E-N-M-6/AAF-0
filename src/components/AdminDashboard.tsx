@@ -23,6 +23,7 @@ import {
   Maximize2,
   AlertTriangle,
   Zap,
+  Unlock,
 } from "lucide-react";
 import { DatabaseState, QuizSubmission, Quiz, User, QuizViolationRecord, AdminSecurityLogItem, QuizQuestionResult } from "../types";
 import { ApiService } from "../services/api";
@@ -505,6 +506,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                             : "✓ تم التصحيح والاعتماد"}
                         </span>
 
+                        {sub.networkInterrupted && (
+                          <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 border border-sky-300 dark:bg-sky-950 dark:text-sky-200 flex items-center gap-1 shadow-2xs">
+                            📶 تسليم بعد انقطاع النت ({sub.disconnectCount || 1} مرة - {sub.offlineDurationSeconds || 0}ث)
+                          </span>
+                        )}
+
                         {sub.violationCount && sub.violationCount > 0 ? (
                           <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1">
                             <AlertTriangle className="w-3 h-3 text-rose-600" />
@@ -529,6 +536,24 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                         >
                           <FileText className="w-3.5 h-3.5" />
                           إرفاق نموذج الإجابة 📝
+                        </button>
+                      )}
+
+                      {isTerminated && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const res = await ApiService.unlockQuizSubmission(sub.quizId, sub.userId);
+                              if (res.db) onUpdateState(res.db);
+                            } catch {
+                              console.warn("Failed to unlock quiz submission");
+                            }
+                          }}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white font-black px-3.5 py-2 rounded-xl text-xs flex items-center gap-1.5 transition-all shadow-2xs cursor-pointer"
+                        >
+                          <Unlock className="w-3.5 h-3.5" />
+                          إعادة فتح للطالب 🔓
                         </button>
                       )}
 

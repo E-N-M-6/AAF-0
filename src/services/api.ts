@@ -89,7 +89,7 @@ export function clearQuizAnswerBackup(quizId: string, userId: string): void {
 }
 
 // --- Network Status & Offline Queue Engine ---
-const OFFLINE_SUBMISSIONS_QUEUE_KEY = "marathon_offline_submissions_queue";
+const OFFLINE_SUBMISSIONS_QUEUE_KEY = "pending_offline_submissions";
 
 export interface OfflineSubmissionItem {
   id: string;
@@ -99,6 +99,12 @@ export interface OfflineSubmissionItem {
   status?: "started" | "grading" | "completed" | "VIOLATION_TERMINATED";
   timestamp: string;
   retries: number;
+  networkInterrupted?: boolean;
+  clientSubmittedAt?: string;
+  disconnectCount?: number;
+  offlineDurationSeconds?: number;
+  frozenRemainingSeconds?: number;
+  awaySeconds?: number;
 }
 
 export function isNetworkOnline(): boolean {
@@ -126,7 +132,7 @@ export function subscribeNetworkStatus(callback: (online: boolean) => void): () 
 export function getOfflineSubmissionsQueue(): OfflineSubmissionItem[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = localStorage.getItem(OFFLINE_SUBMISSIONS_QUEUE_KEY);
+    const raw = localStorage.getItem(OFFLINE_SUBMISSIONS_QUEUE_KEY) || localStorage.getItem("marathon_offline_submissions_queue");
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -150,6 +156,7 @@ export function enqueueOfflineSubmission(item: Omit<OfflineSubmissionItem, "id" 
     id: "offsub_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
     retries: 0,
+    networkInterrupted: true,
   };
   if (existingIdx >= 0) {
     queue[existingIdx] = newItem;
@@ -162,13 +169,14 @@ export function enqueueOfflineSubmission(item: Omit<OfflineSubmissionItem, "id" 
 
 let isSyncingQueue = false;
 
-export async function processOfflineSubmissionsQueue(): Promise<void> {
+export async function processOfflineSubmissionsQueue(onSuccessCallback?: () => void): Promise<void> {
   if (typeof window === "undefined" || !isNetworkOnline() || isSyncingQueue) return;
   const queue = getOfflineSubmissionsQueue();
   if (queue.length === 0) return;
 
   isSyncingQueue = true;
   const remainingQueue: OfflineSubmissionItem[] = [];
+  let syncedAny = false;
 
   for (const item of queue) {
     try {
@@ -180,9 +188,16 @@ export async function processOfflineSubmissionsQueue(): Promise<void> {
           userId: item.userId,
           answers: item.answers,
           status: item.status,
+          networkInterrupted: true,
+          clientSubmittedAt: item.clientSubmittedAt,
+          disconnectCount: item.disconnectCount,
+          offlineDurationSeconds: item.offlineDurationSeconds,
+          frozenRemainingSeconds: item.frozenRemainingSeconds,
+          awaySeconds: item.awaySeconds,
         }),
       });
       clearQuizAnswerBackup(item.quizId, item.userId);
+      syncedAny = true;
       console.log(`[Offline Queue] Successfully synced submission for quiz ${item.quizId}`);
     } catch (err) {
       console.warn(`[Offline Queue] Failed sync attempt ${item.retries + 1} for quiz ${item.quizId}:`, err);
@@ -195,6 +210,10 @@ export async function processOfflineSubmissionsQueue(): Promise<void> {
 
   saveOfflineSubmissionsQueue(remainingQueue);
   isSyncingQueue = false;
+
+  if (syncedAny && onSuccessCallback) {
+    onSuccessCallback();
+  }
 }
 
 if (typeof window !== "undefined") {
@@ -920,12 +939,31 @@ export const ApiService = {
     quizId: string,
     userId: string,
     answers: Record<string, string>,
-    status?: "started" | "grading" | "completed" | "VIOLATION_TERMINATED"
+    status?: "started" | "grading" | "completed" | "VIOLATION_TERMINATED",
+    networkInterrupted?: boolean,
+    telemetry?: {
+      clientSubmittedAt?: string;
+      disconnectCount?: number;
+      offlineDurationSeconds?: number;
+      frozenRemainingSeconds?: number;
+      awaySeconds?: number;
+    }
   ): Promise<{ db: DatabaseState }> {
     saveQuizAnswerBackup(quizId, userId, answers);
 
     if (!isNetworkOnline()) {
-      enqueueOfflineSubmission({ quizId, userId, answers, status });
+      enqueueOfflineSubmission({
+        quizId,
+        userId,
+        answers,
+        status,
+        networkInterrupted: true,
+        clientSubmittedAt: telemetry?.clientSubmittedAt,
+        disconnectCount: telemetry?.disconnectCount,
+        offlineDurationSeconds: telemetry?.offlineDurationSeconds,
+        frozenRemainingSeconds: telemetry?.frozenRemainingSeconds,
+        awaySeconds: telemetry?.awaySeconds,
+      });
       throw new ApiError("معطل مؤقتاً بسبب انقطاع الإنترنت 📡. تم حفظ إجاباتك محلياً وستتم المزامنة تلقائياً فور عودة الاتصال.");
     }
 
@@ -933,13 +971,35 @@ export const ApiService = {
       const res = await fetchJson<{ db: DatabaseState }>("/api/quizzes/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ quizId, userId, answers, status }),
+        body: JSON.stringify({
+          quizId,
+          userId,
+          answers,
+          status,
+          networkInterrupted,
+          clientSubmittedAt: telemetry?.clientSubmittedAt,
+          disconnectCount: telemetry?.disconnectCount,
+          offlineDurationSeconds: telemetry?.offlineDurationSeconds,
+          frozenRemainingSeconds: telemetry?.frozenRemainingSeconds,
+          awaySeconds: telemetry?.awaySeconds,
+        }),
       });
       clearQuizAnswerBackup(quizId, userId);
       return res;
     } catch (err: unknown) {
       if (err instanceof ApiError && (err.status === 503 || err.status === 0 || !isNetworkOnline())) {
-        enqueueOfflineSubmission({ quizId, userId, answers, status });
+        enqueueOfflineSubmission({
+          quizId,
+          userId,
+          answers,
+          status,
+          networkInterrupted: true,
+          clientSubmittedAt: telemetry?.clientSubmittedAt,
+          disconnectCount: telemetry?.disconnectCount,
+          offlineDurationSeconds: telemetry?.offlineDurationSeconds,
+          frozenRemainingSeconds: telemetry?.frozenRemainingSeconds,
+          awaySeconds: telemetry?.awaySeconds,
+        });
       }
       throw err;
     }
@@ -954,7 +1014,8 @@ export const ApiService = {
     leaveDuration: number,
     reason?: string,
     type?: string,
-    details?: string
+    details?: string,
+    awaySeconds?: number
   ): Promise<{ db: DatabaseState }> {
     if (!isNetworkOnline()) {
       return { db: await this.getState().catch(() => ({ users: [], attendance: {}, tasks: [], config: { durationWeeks: 12, points: { meeting: 20, liturgy: 20, praise: 15 } } } as DatabaseState)) };
@@ -962,7 +1023,17 @@ export const ApiService = {
     return fetchJson<{ db: DatabaseState }>("/api/quizzes/log-violation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ quizId, userId, leaveDuration, reason, type, details }),
+      body: JSON.stringify({ quizId, userId, leaveDuration, reason, type, details, awaySeconds }),
+    });
+  },
+
+  /**
+   * Admin unlock locked quiz attempt for student ("إعادة فتح للطالب")
+   */
+  async unlockQuizSubmission(quizId: string, userId: string): Promise<{ success: boolean; db: DatabaseState }> {
+    return fetchJson<{ success: boolean; db: DatabaseState }>(`/api/admin/quizzes/${quizId}/unlock/${userId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
     });
   },
 

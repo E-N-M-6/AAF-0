@@ -157,6 +157,7 @@ export interface AdminSecurityLogItem {
   reason?: string;
   type?: string;
   details?: string;
+  awaySeconds?: number;
   violationCount?: number;
   status?: string;
 }
@@ -174,7 +175,13 @@ export interface QuizSubmission {
   status: "started" | "grading" | "completed" | "graded" | "pending_manual_review" | "pending_auto_grade" | "VIOLATION_TERMINATED";
   isManual?: boolean;
   violationCount?: number;
-  violations?: QuizViolationRecord[];
+  violations?: string[];
+  networkInterrupted?: boolean;
+  clientSubmittedAt?: string;
+  disconnectCount?: number;
+  offlineDurationSeconds?: number;
+  frozenRemainingSeconds?: number;
+  awaySeconds?: number;
 }
 
 export interface AppNotification {

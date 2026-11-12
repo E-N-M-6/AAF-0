@@ -140,7 +140,7 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
   // Calculate scores using the centralized helper - memoized to prevent redundant calculation
   const myScore = React.useMemo(() => {
     const userAtt = state.attendance[currentUser.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
-    return calculateParticipantScore(
+    const rawScore = calculateParticipantScore(
       currentUser,
       userAtt,
       state.tasks,
@@ -151,6 +151,10 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
       state.quizTotals,
       state.quizCounts
     );
+    return {
+      ...rawScore,
+      totalPoints: Math.ceil(rawScore.totalPoints),
+    };
   }, [currentUser, state.attendance, state.tasks, state.quizSubmissions, state.confessions, state.bonuses, state.config, state.quizTotals, state.quizCounts]);
 
   const myTasks = React.useMemo(() => {
@@ -167,19 +171,20 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
       .filter((u) => u && u.role !== "admin" && u.username !== "." && u.id !== "." && u.name !== ".")
       .map((user) => {
         const userAtt = state.attendance[user.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
+        const rawScore = calculateParticipantScore(
+          user,
+          userAtt,
+          state.tasks,
+          state.quizSubmissions,
+          state.confessions,
+          state.bonuses,
+          state.config,
+          state.quizTotals,
+          state.quizCounts
+        );
         return {
           id: user.id,
-          score: calculateParticipantScore(
-            user,
-            userAtt,
-            state.tasks,
-            state.quizSubmissions,
-            state.confessions,
-            state.bonuses,
-            state.config,
-            state.quizTotals,
-            state.quizCounts
-          ).totalPoints,
+          score: Math.ceil(rawScore.totalPoints),
         };
       })
       .sort((a, b) => b.score - a.score);

@@ -48,7 +48,11 @@ export default function Leaderboard({
 
     const scores: ParticipantScore[] = participants.map((user) => {
       const userAtt = attendance[user.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
-      return calculateParticipantScore(user, userAtt, tasks, quizSubmissions, confessions, bonuses, config, quizTotals, quizCounts);
+      const rawScore = calculateParticipantScore(user, userAtt, tasks, quizSubmissions, confessions, bonuses, config, quizTotals, quizCounts);
+      return {
+        ...rawScore,
+        totalPoints: Math.ceil(rawScore.totalPoints),
+      };
     });
 
     const sortedScores = [...scores].sort((a, b) => b.totalPoints - a.totalPoints);

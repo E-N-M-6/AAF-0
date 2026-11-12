@@ -1,6 +1,6 @@
 import React, { useState, useEffect, lazy, Suspense } from "react";
 import { User, DatabaseState, AppNotification, BeforeInstallPromptEvent } from "./types";
-import { ApiService, getSession, clearSession } from "./services/api";
+import { ApiService, getSession, clearSession, processOfflineSubmissionsQueue } from "./services/api";
 import { triggerDazzlingCelebration } from "./lib/confetti";
 
 const Leaderboard = lazy(() => import("./components/Leaderboard"));
@@ -317,6 +317,9 @@ export default function App() {
     const handleOnline = () => {
       setIsOnline(true);
       triggerSuccess("تم استعادة الاتصال بالإنترنت ومزامنة نقاطك وحضورك الجديد بنجاح! 🟢");
+      processOfflineSubmissionsQueue(() => {
+        fetchState(true);
+      });
       fetchState(true);
     };
 
@@ -327,6 +330,11 @@ export default function App() {
 
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
+
+    // Auto-flush pending offline submissions queue on mount
+    processOfflineSubmissionsQueue(() => {
+      fetchState(true);
+    });
 
     return () => {
       window.removeEventListener("online", handleOnline);

@@ -27,6 +27,7 @@ import {
   getQuizAnswerBackupKey,
   isNetworkOnline,
   subscribeNetworkStatus,
+  enqueueOfflineSubmission,
 } from "../services/api";
 import { useExamSecurity } from "../hooks/useExamSecurity";
 import { triggerDazzlingCelebration } from "../lib/confetti";
@@ -60,11 +61,79 @@ export default function QuizRunner({
   // Network connection status
   const [isOnline, setIsOnline] = useState<boolean>(() => isNetworkOnline());
 
+  // Active Quiz Session Key for Mid-Exam Refresh Recovery
+  const sessionKey = `active_quiz_session_${quiz.id}_${currentUser.id}`;
+
+  const loadInitialSession = () => {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = localStorage.getItem(`active_quiz_session_${quiz.id}_${currentUser.id}`);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    } catch {}
+    return null;
+  };
+
+  const initialSessionRef = useRef<any>(loadInitialSession());
+
+  // Connectivity Telemetry Tracking
+  const [disconnectCount, setDisconnectCount] = useState<number>(() => initialSessionRef.current?.disconnectCount || 0);
+  const [offlineDurationSeconds, setOfflineDurationSeconds] = useState<number>(() => initialSessionRef.current?.offlineDurationSeconds || 0);
+  const lastOfflineStartTimeRef = useRef<number | null>(null);
+
+  // Timestamps
+  const [startedAt] = useState<number>(() => initialSessionRef.current?.startedAt || Date.now());
+  const [expiresAt] = useState<number>(() => {
+    if (initialSessionRef.current?.frozenRemainingSeconds !== undefined && initialSessionRef.current?.frozenRemainingSeconds > 0) {
+      return Date.now() + initialSessionRef.current.frozenRemainingSeconds * 1000;
+    }
+    if (initialSessionRef.current?.expiresAt) {
+      return initialSessionRef.current.expiresAt;
+    }
+    const limitMins = quiz.timeLimit && quiz.timeLimit > 0 ? quiz.timeLimit : 120;
+    return Date.now() + limitMins * 60000;
+  });
+
+  const [isInputsLocked, setIsInputsLocked] = useState<boolean>(() => {
+    if (quiz.timeLimit && quiz.timeLimit > 0 && expiresAt) {
+      return Date.now() >= expiresAt;
+    }
+    return false;
+  });
+
+  // Track online/offline transitions & telemetry
   useEffect(() => {
+    const handleOnlineEvent = () => {
+      setIsOnline(true);
+      if (lastOfflineStartTimeRef.current !== null) {
+        const dur = Math.max(0, Math.round((Date.now() - lastOfflineStartTimeRef.current) / 1000));
+        setOfflineDurationSeconds((prev) => prev + dur);
+        lastOfflineStartTimeRef.current = null;
+      }
+    };
+
+    const handleOfflineEvent = () => {
+      setIsOnline(false);
+      setDisconnectCount((prev) => prev + 1);
+      lastOfflineStartTimeRef.current = Date.now();
+    };
+
     const unsubscribe = subscribeNetworkStatus((online) => {
       setIsOnline(online);
+      if (online) handleOnlineEvent();
+      else handleOfflineEvent();
     });
-    return unsubscribe;
+
+    window.addEventListener("online", handleOnlineEvent);
+    window.addEventListener("offline", handleOfflineEvent);
+
+    return () => {
+      unsubscribe();
+      window.removeEventListener("online", handleOnlineEvent);
+      window.removeEventListener("offline", handleOfflineEvent);
+    };
   }, []);
 
   // Pre-exam rules modal state (only required if proctoring is enabled)
@@ -74,13 +143,16 @@ export default function QuizRunner({
   // Local storage backup key for user answers
   const backupKey = getQuizAnswerBackupKey(quiz.id, currentUser.id);
 
-  // Quiz solving states with automatic local backup restoration
+  // Quiz solving states with automatic local session restoration
   const [answers, setAnswers] = useState<Record<string, string>>(() => {
     const init: Record<string, string> = {};
     quiz.questions.forEach((q) => {
       init[q.id] = q.type === "boolean" ? "true" : "";
     });
     if (initialAnswers) return { ...init, ...initialAnswers };
+    if (initialSessionRef.current?.answers) {
+      return { ...init, ...initialSessionRef.current.answers };
+    }
     const restored = getQuizAnswerBackup(quiz.id, currentUser.id);
     if (restored) {
       return { ...init, ...restored };
@@ -98,11 +170,34 @@ export default function QuizRunner({
   const answersRef = useRef(answers);
   answersRef.current = answers;
 
-  // Continuously persist answers to localStorage while user is solving
+  // Continuously persist session state to localStorage for seamless mid-exam refresh recovery
   useEffect(() => {
     if (typeof window === "undefined" || isSubmitting || isSubmittedOptimistic) return;
+    try {
+      localStorage.setItem(
+        sessionKey,
+        JSON.stringify({
+          quizId: quiz.id,
+          userId: currentUser.id,
+          answers,
+          startedAt,
+          expiresAt,
+          disconnectCount,
+          offlineDurationSeconds,
+        })
+      );
+    } catch {}
     saveQuizAnswerBackup(quiz.id, currentUser.id, answers);
-  }, [answers, quiz.id, currentUser.id, isSubmitting, isSubmittedOptimistic]);
+  }, [quiz.id, currentUser.id, answers, startedAt, expiresAt, disconnectCount, offlineDurationSeconds, isSubmitting, isSubmittedOptimistic, sessionKey]);
+
+  // Clean session storage upon exam submission
+  const clearActiveSession = () => {
+    if (typeof window === "undefined") return;
+    try {
+      localStorage.removeItem(sessionKey);
+      clearQuizAnswerBackup(quiz.id, currentUser.id);
+    } catch {}
+  };
 
   // Format time remaining
   const formatTime = (seconds: number) => {
@@ -125,9 +220,11 @@ export default function QuizRunner({
     requestFullscreen,
     exitFullscreen,
     unbindSecurity,
+    lastAwaySeconds,
   } = useExamSecurity({
     active: hasAcceptedRules && !isSubmitting && !isSubmittedOptimistic && !terminatedByViolation,
     isSubmitting: isSubmitting || isSubmittedOptimistic,
+    isOffline: !isOnline,
     proctoringMode,
     graceSeconds: isStrictImmediateKick ? 0 : (quiz.graceSeconds || 3),
     maxLeaves: isStrictImmediateKick ? 0 : (quiz.maxLeaves !== undefined ? quiz.maxLeaves : 1),
@@ -143,15 +240,16 @@ export default function QuizRunner({
               ? `مخالفة رقم (${count}) في الوضع الصارم - مغادرة شاشة الاختبار لمدة ${duration} ثانية`
               : `مخالفة في وضع التنبيه - مغادرة شاشة الاختبار لمدة ${duration} ثانية`),
           details?.type,
-          details?.details
+          details?.details,
+          details?.awaySeconds
         );
       } catch (err) {
         console.warn("فشل تسجيل المخالفة بالخادم:", err);
       }
     },
-    onAutoSubmit: async (_count, _duration, reason) => {
-      // Immediate kick or incident limit breached -> auto-terminate
-      handleViolationAutoSubmit(reason);
+    onAutoSubmit: async (_count, duration, reason, details) => {
+      // Strike 2 or immediate kick -> capture remaining time and lock attempt
+      handleViolationAutoSubmit(reason, details?.awaySeconds || duration);
     },
   });
 
@@ -163,21 +261,35 @@ export default function QuizRunner({
   }, [exitFullscreen]);
 
   // Handle auto-submit when violation limit is breached or strict kick triggered
-  const handleViolationAutoSubmit = async (reason?: string) => {
+  const handleViolationAutoSubmit = async (reason?: string, awaySecs?: number) => {
     if (isSubmitting || isSubmittedOptimistic || terminatedByViolation) return;
     unbindSecurity();
     setTerminatedByViolation(true);
     setIsSubmitting(true);
     await exitFullscreen().catch(() => {});
 
+    // Calculate exact frozen remaining seconds left on countdown at lock time
+    const frozenSecs = remainingSeconds !== null
+      ? Math.max(0, remainingSeconds)
+      : Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+
+    const telemetryData = {
+      frozenRemainingSeconds: frozenSecs,
+      awaySeconds: awaySecs || 0,
+      disconnectCount,
+      offlineDurationSeconds,
+    };
+
     try {
       const data = await ApiService.submitQuiz(
         quiz.id,
         currentUser.id,
         answersRef.current,
-        "VIOLATION_TERMINATED"
+        "VIOLATION_TERMINATED",
+        false,
+        telemetryData
       );
-      clearQuizAnswerBackup(quiz.id, currentUser.id);
+      clearActiveSession();
       onUpdateState(data.db);
       onError(
         reason
@@ -186,6 +298,7 @@ export default function QuizRunner({
       );
       onClose();
     } catch (err: unknown) {
+      clearActiveSession();
       const msg = err instanceof Error ? err.message : "حدث خطأ أثناء قفل الامتحان";
       onError(msg);
       onClose();
@@ -194,18 +307,41 @@ export default function QuizRunner({
     }
   };
 
-  // Regular auto-submit on timer expiration
+  // Regular auto-submit on timer expiration with timestamp lockout
   const handleTimerAutoSubmit = async () => {
     if (isSubmitting || isSubmittedOptimistic || terminatedByViolation) return;
     unbindSecurity();
+    setIsInputsLocked(true);
     setIsSubmitting(true);
     setIsSubmittedOptimistic(true);
-    saveQuizAnswerBackup(quiz.id, currentUser.id, answersRef.current);
     await exitFullscreen().catch(() => {});
 
-    ApiService.submitQuiz(quiz.id, currentUser.id, answersRef.current)
+    const clientSubmittedAt = new Date(Math.min(Date.now(), expiresAt)).toISOString();
+    const telemetryData = {
+      clientSubmittedAt,
+      disconnectCount: Math.max(isOnline ? 0 : 1, disconnectCount),
+      offlineDurationSeconds,
+    };
+
+    if (!isOnline) {
+      enqueueOfflineSubmission({
+        quizId: quiz.id,
+        userId: currentUser.id,
+        answers: answersRef.current,
+        status: "completed",
+        networkInterrupted: true,
+        clientSubmittedAt,
+        disconnectCount: telemetryData.disconnectCount,
+        offlineDurationSeconds: telemetryData.offlineDurationSeconds,
+      });
+      clearActiveSession();
+      setIsSubmitting(false);
+      return;
+    }
+
+    ApiService.submitQuiz(quiz.id, currentUser.id, answersRef.current, "completed", false, telemetryData)
       .then((data) => {
-        clearQuizAnswerBackup(quiz.id, currentUser.id);
+        clearActiveSession();
         onUpdateState(data.db);
         const myScore = data.db.quizSubmissions?.find(
           (s) => s.quizId === quiz.id && s.userId === currentUser.id
@@ -219,43 +355,53 @@ export default function QuizRunner({
         }
       })
       .catch((err: unknown) => {
+        enqueueOfflineSubmission({
+          quizId: quiz.id,
+          userId: currentUser.id,
+          answers: answersRef.current,
+          status: "completed",
+          networkInterrupted: true,
+          clientSubmittedAt,
+          disconnectCount: telemetryData.disconnectCount,
+          offlineDurationSeconds: telemetryData.offlineDurationSeconds,
+        });
+        clearActiveSession();
         const msg = err instanceof Error ? err.message : "حدث خطأ أثناء التسليم التلقائي";
-        onError(`تنبيه: تم حفظ إجاباتك محلياً، لكن تعذر التأكيد الفوري: ${msg}`);
+        onError(`تنبيه: تم حفظ إجاباتك محلياً وستتم المزامنة تلقائياً: ${msg}`);
       })
       .finally(() => {
         setIsSubmitting(false);
       });
   };
 
-  // Timer countdown
+  // Timer countdown computed strictly from expiresAt - Date.now()
   useEffect(() => {
     if (!hasAcceptedRules || isSubmittedOptimistic || !quiz.timeLimit || quiz.timeLimit <= 0) {
       setRemainingSeconds(null);
       return;
     }
 
-    const durationSeconds = quiz.timeLimit * 60;
-    setRemainingSeconds(durationSeconds);
+    const checkAndTick = () => {
+      const remainingMs = expiresAt - Date.now();
+      const secsLeft = Math.max(0, Math.floor(remainingMs / 1000));
+      setRemainingSeconds(secsLeft);
 
-    const interval = setInterval(() => {
-      setRemainingSeconds((prev) => {
-        if (prev === null) return null;
-        if (prev <= 1) {
-          clearInterval(interval);
-          handleTimerAutoSubmit();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+      if (secsLeft <= 0) {
+        setIsInputsLocked(true);
+        handleTimerAutoSubmit();
+      }
+    };
+
+    checkAndTick();
+    const interval = setInterval(checkAndTick, 1000);
 
     return () => clearInterval(interval);
-  }, [hasAcceptedRules, isSubmittedOptimistic, quiz.timeLimit]);
+  }, [hasAcceptedRules, isSubmittedOptimistic, quiz.timeLimit, expiresAt]);
 
   // Submit action by student with optimistic UI transition and background network submission
   const handleSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (isSubmitting || isSubmittedOptimistic || terminatedByViolation) return;
+    if (isSubmitting || isSubmittedOptimistic || terminatedByViolation || isInputsLocked) return;
 
     // Check if any unanswered question
     const unanswered = quiz.questions.some((q) => !answers[q.id]?.trim());
@@ -271,20 +417,40 @@ export default function QuizRunner({
     setIsSubmitting(true);
     setIsSubmittedOptimistic(true);
 
-    // 3. Persist local answer backup in localStorage before initiating submit
-    saveQuizAnswerBackup(quiz.id, currentUser.id, answersRef.current);
-
-    // 4. Safely exit fullscreen without triggering false security warnings
+    // 3. Safely exit fullscreen without triggering false security warnings
     await exitFullscreen().catch(() => {});
 
-    // 5. Trigger celebration animation
+    // 4. Trigger celebration animation
     triggerDazzlingCelebration();
 
+    const clientSubmittedAt = new Date(Math.min(Date.now(), expiresAt)).toISOString();
+    const telemetryData = {
+      clientSubmittedAt,
+      disconnectCount: Math.max(isOnline ? 0 : 1, disconnectCount),
+      offlineDurationSeconds,
+    };
+
+    // 5. Handle offline submission queue
+    if (!isOnline) {
+      enqueueOfflineSubmission({
+        quizId: quiz.id,
+        userId: currentUser.id,
+        answers: answersRef.current,
+        status: "completed",
+        networkInterrupted: true,
+        clientSubmittedAt,
+        disconnectCount: telemetryData.disconnectCount,
+        offlineDurationSeconds: telemetryData.offlineDurationSeconds,
+      });
+      clearActiveSession();
+      setIsSubmitting(false);
+      return;
+    }
+
     // 6. Execute API network request asynchronously in the background
-    ApiService.submitQuiz(quiz.id, currentUser.id, answersRef.current)
+    ApiService.submitQuiz(quiz.id, currentUser.id, answersRef.current, "completed", false, telemetryData)
       .then((data) => {
-        // Clear local answer backup ONLY after HTTP 200 response confirmation
-        clearQuizAnswerBackup(quiz.id, currentUser.id);
+        clearActiveSession();
 
         onUpdateState(data.db);
 
@@ -311,8 +477,19 @@ export default function QuizRunner({
         }
       })
       .catch((err: unknown) => {
+        enqueueOfflineSubmission({
+          quizId: quiz.id,
+          userId: currentUser.id,
+          answers: answersRef.current,
+          status: "completed",
+          networkInterrupted: true,
+          clientSubmittedAt,
+          disconnectCount: telemetryData.disconnectCount,
+          offlineDurationSeconds: telemetryData.offlineDurationSeconds,
+        });
+        clearActiveSession();
         const msg = err instanceof Error ? err.message : "حدث خطأ أثناء الاتصال بالخادم";
-        onError(`ملاحظة: إجاباتك محفوظة بأمان محلياً. تعذر التأكيد فوراً: ${msg}`);
+        onError(`ملاحظة: إجاباتك محفوظة بأمان محلياً وستتم المزامنة تلقائياً فور عودة الشبكة: ${msg}`);
       })
       .finally(() => {
         setIsSubmitting(false);
@@ -406,6 +583,13 @@ export default function QuizRunner({
                 <strong className="text-amber-700 dark:text-amber-400 font-extrabold">إبقاء الشاشة مضاءة (Screen Wake Lock):</strong>{" "}
                 سيتم إبقاء إضاءة شاشة هاتفك نشطة تلقائياً لمنع قفل الشاشة أثناء قراءتك في الكتاب المقدس الورقي.
               </p>
+            </div>
+
+            <div className="p-3 bg-sky-100/90 dark:bg-sky-950/80 border border-sky-300 dark:border-sky-800 rounded-xl text-sky-900 dark:text-sky-200 text-xs font-bold leading-relaxed flex items-center gap-2">
+              <span className="text-base shrink-0">🔕</span>
+              <span>
+                <strong>ملاحظة هامة لطبيعة الهواتف:</strong> يرجى تفعيل <u>وضع عدم الإزعاج (Do Not Disturb) 🔕</u> قبل بدء الامتحان لتجنب أي إزعاج أو مكالمات قد تتسبب في الخروج عن الصفحة.
+              </span>
             </div>
 
             {isStrictImmediateKick ? (
@@ -604,6 +788,16 @@ export default function QuizRunner({
             </button>
           </div>
 
+          {/* Sticky Offline Arabic Banner */}
+          {!isOnline && (
+            <div className="mb-3 bg-amber-500 text-white p-3 rounded-2xl flex items-center gap-2.5 text-xs font-black shadow-md animate-pulse">
+              <WifiOff className="w-5 h-5 shrink-0 text-amber-100" />
+              <span className="leading-relaxed">
+                انقطع الاتصال بالإنترنت — لا تقلق، إجاباتك محفوظة بأمان على جهازك. يمكنك استكمال الحل وسيتم التسليم تلقائياً فور عودة الشبكة.
+              </span>
+            </div>
+          )}
+
           {/* Friendly Toast for WARN mode violations */}
           <AnimatePresence>
             {warnToastMessage && (
@@ -691,8 +885,11 @@ export default function QuizRunner({
                           <button
                             key={optIdx}
                             type="button"
+                            disabled={isInputsLocked || isSubmitting}
                             onClick={() => setAnswers({ ...answers, [q.id]: optIdx.toString() })}
-                            className={`p-3 rounded-xl border text-right text-xs md:text-sm font-semibold transition-all cursor-pointer flex items-center justify-start gap-2 ${
+                            className={`p-3 rounded-xl border text-right text-xs md:text-sm font-semibold transition-all flex items-center justify-start gap-2 ${
+                              isInputsLocked ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+                            } ${
                               isSelected
                                 ? "bg-natural-green text-white border-natural-green font-extrabold shadow-md ring-2 ring-natural-green/30"
                                 : "bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 border-slate-200 dark:border-slate-700"
@@ -719,8 +916,11 @@ export default function QuizRunner({
                     <div className="flex gap-3 pt-1">
                       <button
                         type="button"
+                        disabled={isInputsLocked || isSubmitting}
                         onClick={() => setAnswers({ ...answers, [q.id]: "true" })}
-                        className={`flex-1 p-3 rounded-xl border text-center text-xs md:text-sm font-extrabold transition-all cursor-pointer ${
+                        className={`flex-1 p-3 rounded-xl border text-center text-xs md:text-sm font-extrabold transition-all ${
+                          isInputsLocked ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+                        } ${
                           answers[q.id] === "true"
                             ? "bg-emerald-600 text-white border-emerald-600 shadow-md ring-2 ring-emerald-500/30"
                             : "bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 border-slate-200 dark:border-slate-700"
@@ -730,8 +930,11 @@ export default function QuizRunner({
                       </button>
                       <button
                         type="button"
+                        disabled={isInputsLocked || isSubmitting}
                         onClick={() => setAnswers({ ...answers, [q.id]: "false" })}
-                        className={`flex-1 p-3 rounded-xl border text-center text-xs md:text-sm font-extrabold transition-all cursor-pointer ${
+                        className={`flex-1 p-3 rounded-xl border text-center text-xs md:text-sm font-extrabold transition-all ${
+                          isInputsLocked ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+                        } ${
                           answers[q.id] === "false"
                             ? "bg-rose-600 text-white border-rose-600 shadow-md ring-2 ring-rose-500/30"
                             : "bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 border-slate-200 dark:border-slate-700"
@@ -748,11 +951,12 @@ export default function QuizRunner({
                       <input
                         type="text"
                         required
+                        disabled={isInputsLocked || isSubmitting}
                         placeholder="اكتب إجابتك لإكمال الفراغ هنا..."
                         value={answers[q.id] || ""}
                         onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
                         onPaste={handlePaste}
-                        className="w-full text-xs md:text-sm p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 outline-hidden focus:border-natural-green font-semibold leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-500"
+                        className="w-full text-xs md:text-sm p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 outline-hidden focus:border-natural-green font-semibold leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-500 disabled:opacity-60 disabled:cursor-not-allowed"
                       />
                     </div>
                   )}
@@ -763,11 +967,12 @@ export default function QuizRunner({
                       <textarea
                         rows={3}
                         required
+                        disabled={isInputsLocked || isSubmitting}
                         placeholder="اكتب من قال هذه العبارة ومناسبتها أو سياقها هنا..."
                         value={answers[q.id] || ""}
                         onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
                         onPaste={handlePaste}
-                        className="w-full text-xs md:text-sm p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 outline-hidden focus:border-natural-green font-semibold leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-500"
+                        className="w-full text-xs md:text-sm p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 outline-hidden focus:border-natural-green font-semibold leading-relaxed placeholder:text-slate-400 dark:placeholder:text-slate-500 disabled:opacity-60 disabled:cursor-not-allowed"
                       />
                     </div>
                   )}
@@ -778,6 +983,7 @@ export default function QuizRunner({
                       <textarea
                         rows={3}
                         required
+                        disabled={isInputsLocked || isSubmitting}
                         placeholder="اكتب إجابتك المقالية بالتفصيل هنا... (سيتم مراجعتها من لجنة التقييم بدقة تشجيعية وعادلة!)"
                         value={answers[q.id] || ""}
                         onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
@@ -822,16 +1028,14 @@ export default function QuizRunner({
                     <AlertTriangle className="w-8 h-8" />
                   </div>
                   <h4 className="text-base font-black text-rose-600 dark:text-rose-400">
-                    تنبيه أمني: تم رصد الخروج من شاشة الامتحان!
+                    تحذير أخير: تم رصد مغادرة شاشة الامتحان لمدة {lastAwaySeconds || lastLeaveDuration || 0} ثانية!
                   </h4>
                   <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed font-bold">
-                    التبديل بين التطبيقات أو الخروج من وضع ملء الشاشة غير مسموح. في حال التكرار سيتم قفل الامتحان وتطبيق التسليم التلقائي.
+                    أي خروج قادم سيؤدي لإغلاق الامتحان نهائياً وتسليم الإجابات كإلغاء لمخالفة أمنية.
                   </p>
-                  {lastLeaveDuration !== null && (
-                    <div className="inline-block bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 px-3 py-1 rounded-lg text-[11px] font-black">
-                      مدة الخروج المسجلة: {lastLeaveDuration} ثوانٍ (مخالفة {incidentCount} من {quiz.maxLeaves || 1})
-                    </div>
-                  )}
+                  <div className="inline-block bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 px-3 py-1 rounded-lg text-[11px] font-black">
+                    مدة الخروج المسجلة: {lastAwaySeconds || lastLeaveDuration || 0} ثانية (الإنذار رقم {incidentCount})
+                  </div>
                 </div>
 
                 <div className="pt-2">

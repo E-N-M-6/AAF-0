@@ -763,6 +763,7 @@ interface QuizViolationRecord {
   quizId: string;
   timestamp: string;
   leaveDuration: number;
+  awaySeconds?: number;
   reason?: string;
   type?: string;
   details?: string;
@@ -782,6 +783,12 @@ interface QuizSubmission {
   isManual?: boolean;
   violationCount?: number;
   violations?: QuizViolationRecord[];
+  networkInterrupted?: boolean;
+  clientSubmittedAt?: string;
+  disconnectCount?: number;
+  offlineDurationSeconds?: number;
+  frozenRemainingSeconds?: number;
+  awaySeconds?: number;
 }
 
 interface DatabaseSchema {
@@ -3568,7 +3575,7 @@ app.post("/api/quizzes/start", mutexHandler(async (req, res) => {
 
 // 11.8 Log Quiz Security Violation (Participant or Admin)
 app.post("/api/quizzes/log-violation", mutexHandler(async (req, res) => {
-  const { quizId, userId, leaveDuration, reason, type, details } = req.body;
+  const { quizId, userId, leaveDuration, awaySeconds, reason, type, details } = req.body;
   if (!quizId || !userId) {
     return res.status(400).json({ error: "بيانات رصد المخالفة غير مكتملة" });
   }
@@ -3590,12 +3597,15 @@ app.post("/api/quizzes/log-violation", mutexHandler(async (req, res) => {
     return res.status(404).json({ error: "الاختبار غير موجود" });
   }
 
+  const calculatedAwaySeconds = typeof awaySeconds === "number" ? awaySeconds : (typeof leaveDuration === "number" ? leaveDuration : 0);
+
   const violationRecord: QuizViolationRecord = {
     id: "viol_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
     userId,
     quizId,
     timestamp: new Date().toISOString(),
     leaveDuration: typeof leaveDuration === "number" ? Math.max(0, leaveDuration) : Math.max(0, parseFloat(leaveDuration) || 0),
+    awaySeconds: calculatedAwaySeconds,
     reason: reason || "تم رصد مغادرة شاشة الاختبار / التبديل بين التطبيقات",
     type: type || "visibility_hidden",
     details: details || reason,
@@ -3616,6 +3626,7 @@ app.post("/api/quizzes/log-violation", mutexHandler(async (req, res) => {
   const sub = db.quizSubmissions.find(s => s.quizId === quizId && s.userId === userId);
   if (sub) {
     sub.violationCount = (sub.violationCount || 0) + 1;
+    sub.awaySeconds = calculatedAwaySeconds;
     if (!sub.violations) {
       sub.violations = [];
     }
@@ -3705,7 +3716,8 @@ function sanitizeReasoningText(text?: string): string {
 
 // 12. Instant Sub-Second Deterministic Quiz Submission Endpoint
 app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, res) => {
-  const { quizId, userId, answers, status } = req.body;
+  const { quizId, userId, answers, status, networkInterrupted, clientSubmittedAt, disconnectCount, offlineDurationSeconds, frozenRemainingSeconds, awaySeconds } = req.body;
+  const isNetworkInterrupted = Boolean(networkInterrupted);
   if (!quizId || !userId || !answers) {
     return res.status(400).json({ error: "بيانات الإجابة غير مكتملة" });
   }
@@ -3837,7 +3849,7 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
       : (hasPendingManual ? "pending_manual_review" : "completed"));
 
   const newSubmission: QuizSubmission = {
-    id: "sub_" + Date.now() + "_" + Math.floor(Math.random() * 1000000),
+    id: `sub_${quizId}_${userId}`,
     quizId,
     userId,
     answers,
@@ -3847,14 +3859,20 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
     submittedAt: new Date().toISOString(),
     status: submissionStatus,
     violationCount: existingSub?.violationCount || (isViolation ? 1 : 0),
-    violations: existingSub?.violations || []
+    violations: existingSub?.violations || [],
+    ...(isNetworkInterrupted ? { networkInterrupted: true } : {}),
+    ...(typeof clientSubmittedAt === "string" ? { clientSubmittedAt } : {}),
+    ...(typeof disconnectCount === "number" ? { disconnectCount } : {}),
+    ...(typeof offlineDurationSeconds === "number" ? { offlineDurationSeconds } : {}),
+    ...(typeof frozenRemainingSeconds === "number" ? { frozenRemainingSeconds } : {}),
+    ...(typeof awaySeconds === "number" ? { awaySeconds } : {})
   };
 
   if (!db.quizSubmissions) {
     db.quizSubmissions = [];
   }
 
-  const existingIdx = db.quizSubmissions.findIndex(s => s.quizId === quizId && s.userId === userId);
+  const existingIdx = db.quizSubmissions.findIndex(s => (s.quizId === quizId && s.userId === userId) || s.id === `sub_${quizId}_${userId}`);
   if (existingIdx !== -1) {
     db.quizSubmissions[existingIdx] = {
       ...db.quizSubmissions[existingIdx],
@@ -3865,7 +3883,13 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
       submittedAt: new Date().toISOString(),
       status: submissionStatus,
       violationCount: db.quizSubmissions[existingIdx].violationCount || (isViolation ? 1 : 0),
-      violations: db.quizSubmissions[existingIdx].violations || []
+      violations: db.quizSubmissions[existingIdx].violations || [],
+      ...(isNetworkInterrupted || db.quizSubmissions[existingIdx].networkInterrupted ? { networkInterrupted: true } : {}),
+      ...(typeof clientSubmittedAt === "string" ? { clientSubmittedAt } : {}),
+      ...(typeof disconnectCount === "number" ? { disconnectCount: Math.max(disconnectCount, db.quizSubmissions[existingIdx].disconnectCount || 0) } : {}),
+      ...(typeof offlineDurationSeconds === "number" ? { offlineDurationSeconds: Math.max(offlineDurationSeconds, db.quizSubmissions[existingIdx].offlineDurationSeconds || 0) } : {}),
+      ...(typeof frozenRemainingSeconds === "number" ? { frozenRemainingSeconds } : {}),
+      ...(typeof awaySeconds === "number" ? { awaySeconds } : {})
     };
   } else {
     db.quizSubmissions.push(newSubmission);
@@ -3904,6 +3928,35 @@ app.post(["/api/quizzes/submit", "/api/quiz/submit"], mutexHandler(async (req, r
           ? "تم تسليم الاختبار بنجاح وبانتظار تصحيح المشرف!"
           : "تم تسليم وحل الاختبار وتقييمه بنجاح!",
     submission: existingIdx !== -1 ? db.quizSubmissions[existingIdx] : newSubmission,
+    db: sanitizeDBState(db, user)
+  });
+}));
+
+// 12.1 Admin Allow Resume / Unlock Endpoint
+app.post("/api/admin/quizzes/:quizId/unlock/:userId", requireAdmin, mutexHandler(async (req, res) => {
+  const { quizId, userId } = req.params;
+  if (!quizId || !userId) {
+    return res.status(400).json({ error: "معرف الاختبار والمشارك مطلوبان" });
+  }
+
+  const user = await authenticateUser(req);
+  const db = await readDB();
+  if (!db.quizSubmissions) {
+    db.quizSubmissions = [];
+  }
+
+  const subIndex = db.quizSubmissions.findIndex(s => (s.quizId === quizId && s.userId === userId) || s.id === `sub_${quizId}_${userId}`);
+  if (subIndex === -1) {
+    return res.status(404).json({ error: "لم يتم العثور على محاولة لهذا الطالب في هذا الاختبار." });
+  }
+
+  const sub = db.quizSubmissions[subIndex];
+  sub.status = "started";
+  sub.violationCount = 1; // Keep student on final warning (Strike 1)
+
+  await queueWriteDB(db);
+  res.status(200).json({
+    message: "تم إعادة فتح الاختبار للطالب بنجاح بنتيجة معلقة والمحافظة على الوقت المتبقي والإجابات المحفوظة.",
     db: sanitizeDBState(db, user)
   });
 }));

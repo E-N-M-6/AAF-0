@@ -6,6 +6,7 @@ export interface SecurityViolationDetails {
   type: "fullscreen_exit" | "visibility_hidden" | "window_blur" | "copy_paste_attempt" | "strict_immediate_kick" | string;
   timestamp: string;
   details?: string;
+  awaySeconds?: number;
 }
 
 export interface UseExamSecurityOptions {
@@ -15,6 +16,7 @@ export interface UseExamSecurityOptions {
   maxLeaves?: number;
   strictImmediateKick?: boolean;
   isSubmitting?: boolean;
+  isOffline?: boolean;
   onViolation?: (
     incidentCount: number,
     leaveDuration: number,
@@ -43,6 +45,7 @@ export interface UseExamSecurityReturn {
   requestFullscreen: () => Promise<void>;
   exitFullscreen: () => Promise<void>;
   unbindSecurity: () => void;
+  lastAwaySeconds: number;
 }
 
 export function useExamSecurity({
@@ -52,6 +55,7 @@ export function useExamSecurity({
   maxLeaves = 1,
   strictImmediateKick = false,
   isSubmitting = false,
+  isOffline = false,
   onViolation,
   onAutoSubmit,
 }: UseExamSecurityOptions): UseExamSecurityReturn {
@@ -59,6 +63,7 @@ export function useExamSecurity({
   const [incidentCount, setIncidentCount] = useState<number>(0);
   const [warningModalOpen, setWarningModalOpen] = useState<boolean>(false);
   const [lastLeaveDuration, setLastLeaveDuration] = useState<number | null>(null);
+  const [lastAwaySeconds, setLastAwaySeconds] = useState<number>(0);
   const [warnToastMessage, setWarnToastMessage] = useState<string | null>(null);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [isFocusLost, setIsFocusLost] = useState<boolean>(false);
@@ -66,10 +71,37 @@ export function useExamSecurity({
   const leaveStartTimeRef = useRef<number | null>(null);
   const leaveReasonTypeRef = useRef<string>("visibility_hidden");
   const isLeavingRef = useRef<boolean>(false);
+  const graceTimerRef = useRef<any>(null);
   const incidentsRef = useRef<number>(0);
   const hasAutoSubmittedRef = useRef<boolean>(false);
   const hasEnteredFullscreenRef = useRef<boolean>(false);
   const wakeLockSentinelRef = useRef<any>(null);
+
+  const isOfflineRef = useRef<boolean>(Boolean(isOffline));
+  const recoveryWindowUntilRef = useRef<number>(0);
+
+  useEffect(() => {
+    const wasOffline = isOfflineRef.current;
+    const isNowOffline = Boolean(isOffline);
+    isOfflineRef.current = isNowOffline;
+
+    if (isNowOffline) {
+      setWarningModalOpen(false);
+      setWarnToastMessage(null);
+      setIsFocusLost(false);
+    } else if (wasOffline && !isNowOffline) {
+      // Transitioning from offline back to online: set a 5s recovery window to absorb network reconnection events
+      recoveryWindowUntilRef.current = Date.now() + 5000;
+      setIsFocusLost(false);
+    }
+  }, [isOffline]);
+
+  const isExemptDueToOffline = useCallback((): boolean => {
+    if (isOfflineRef.current) return true;
+    if (typeof navigator !== "undefined" && !navigator.onLine) return true;
+    if (Date.now() < recoveryWindowUntilRef.current) return true;
+    return false;
+  }, []);
 
   // Synchronous live refs to guarantee instant unbinding & short-circuiting during submit
   const activeRef = useRef<boolean>(active && !isSubmitting);
@@ -224,23 +256,22 @@ export function useExamSecurity({
           type: "fullscreen_exit",
           timestamp: new Date().toISOString(),
           details: reason,
+          awaySeconds: 0,
         };
 
         if (onViolationRef.current && activeRef.current && !isSubmittingRef.current) {
           onViolationRef.current(nextCount, 0, reason, violationDetails);
         }
 
-        // Check if strict kick or incident limit breached
-        if (strictImmediateKick || (proctoringMode === "STRICT" && nextCount > maxLeaves)) {
+        // Check 2-strike policy (strike 2 auto-locks)
+        if (strictImmediateKick || nextCount >= 2) {
           hasAutoSubmittedRef.current = true;
           setWarningModalOpen(false);
           if (onAutoSubmitRef.current && activeRef.current && !isSubmittingRef.current) {
             onAutoSubmitRef.current(nextCount, 0, reason, violationDetails);
           }
-        } else if (proctoringMode === "STRICT") {
+        } else {
           setWarningModalOpen(true);
-        } else if (proctoringMode === "WARN") {
-          setWarnToastMessage(`⚠️ تنبيه: تم الخروج من وضع ملء الشاشة! يرجى البقاء في وضع ملء الشاشة طوال فترة الاختبار.`);
         }
       }
     };
@@ -254,14 +285,13 @@ export function useExamSecurity({
     };
   }, [active, isSubmitting, proctoringMode, strictImmediateKick, maxLeaves, checkIsFullscreen]);
 
-  // 3. Prevent text selection, copy/cut/paste, and contextmenu when proctoring is enabled or STRICT mode active
+  // 3. Prevent text selection, copy/cut/paste, and contextmenu
   useEffect(() => {
     if (!active || isSubmitting || proctoringMode === "OFF") return;
 
     const preventDefaultAndLog = (e: Event) => {
       if (!activeRef.current || isSubmittingRef.current) return;
       
-      // In STRICT mode, prevent copying/pasting and right click context menu
       if (proctoringMode === "STRICT") {
         e.preventDefault();
         const typeStr = e.type;
@@ -272,6 +302,7 @@ export function useExamSecurity({
             type: "copy_paste_attempt",
             timestamp: new Date().toISOString(),
             details: reason,
+            awaySeconds: 0,
           });
         }
       }
@@ -290,57 +321,30 @@ export function useExamSecurity({
     };
   }, [active, isSubmitting, proctoringMode]);
 
-  // 4. Focus Loss & Focus-Blur Tracking & Strict Immediate Kick
+  // 4. Focus Loss & Focus-Blur Tracking with 3-Second Grace Window & 2-Strike Enforcement
   useEffect(() => {
     if (!active || isSubmitting || proctoringMode === "OFF") {
       leaveStartTimeRef.current = null;
       isLeavingRef.current = false;
+      if (graceTimerRef.current) {
+        clearTimeout(graceTimerRef.current);
+        graceTimerRef.current = null;
+      }
       setIsFocusLost(false);
       setWarningModalOpen(false);
       setWarnToastMessage(null);
       return;
     }
 
-    // Evaluate focus status for canvas/content blurring
     const updateFocusLossState = () => {
       if (typeof document === "undefined" || !activeRef.current || isSubmittingRef.current) return;
-      const hasFocus = typeof document.hasFocus === "function" ? document.hasFocus() : true;
       const isHidden = document.visibilityState === "hidden";
-      setIsFocusLost(isHidden || !hasFocus);
-    };
-
-    const handleImmediateKick = (reason: string, type: string) => {
-      if (!activeRef.current || isSubmittingRef.current || hasAutoSubmittedRef.current) return;
-      hasAutoSubmittedRef.current = true;
-      const nextCount = incidentsRef.current + 1;
-      incidentsRef.current = nextCount;
-      setIncidentCount(nextCount);
-      setLastLeaveDuration(0);
-      setWarningModalOpen(false);
-
-      const violationDetails: SecurityViolationDetails = {
-        type,
-        timestamp: new Date().toISOString(),
-        details: reason,
-      };
-
-      if (onViolationRef.current && activeRef.current && !isSubmittingRef.current) {
-        onViolationRef.current(nextCount, 0, reason, violationDetails);
-      }
-      if (onAutoSubmitRef.current && activeRef.current && !isSubmittingRef.current) {
-        onAutoSubmitRef.current(nextCount, 0, reason, violationDetails);
-      }
+      setIsFocusLost(isHidden);
     };
 
     const handleLeave = (type: string) => {
       if (!activeRef.current || isSubmittingRef.current) return;
       updateFocusLossState();
-
-      // STRICT IMMEDIATE KICK: Instant submission on the 1st trigger of visibilitychange or blur
-      if (strictImmediateKick || (proctoringMode === "STRICT" && maxLeaves === 0)) {
-        handleImmediateKick("مغادرة فورية لشاشة الاختبار (إنهاء فوري مفعل)", type);
-        return;
-      }
 
       if (!isLeavingRef.current) {
         isLeavingRef.current = true;
@@ -356,17 +360,26 @@ export function useExamSecurity({
       if (!isLeavingRef.current || leaveStartTimeRef.current === null) {
         isLeavingRef.current = false;
         leaveStartTimeRef.current = null;
+        if (graceTimerRef.current) {
+          clearTimeout(graceTimerRef.current);
+          graceTimerRef.current = null;
+        }
         return;
       }
 
       const leaveDurationMs = Date.now() - leaveStartTimeRef.current;
-      const leaveDurationSeconds = Math.round(leaveDurationMs / 1000);
+      const awaySecs = Math.max(1, Math.round(leaveDurationMs / 1000));
       const leaveType = leaveReasonTypeRef.current || "visibility_hidden";
+
       isLeavingRef.current = false;
       leaveStartTimeRef.current = null;
+      if (graceTimerRef.current) {
+        clearTimeout(graceTimerRef.current);
+        graceTimerRef.current = null;
+      }
 
-      // Ignore focus losses lasting less than graceSeconds threshold
-      if (leaveDurationSeconds < graceSeconds) {
+      // If returned within 3 seconds grace period (e.g., declining incoming call/banner), ZERO penalty
+      if (leaveDurationMs < 3000) {
         return;
       }
 
@@ -377,31 +390,30 @@ export function useExamSecurity({
       const nextCount = incidentsRef.current + 1;
       incidentsRef.current = nextCount;
       setIncidentCount(nextCount);
-      setLastLeaveDuration(leaveDurationSeconds);
+      setLastLeaveDuration(awaySecs);
+      setLastAwaySeconds(awaySecs);
 
-      const reason = `مغادرة شاشة الاختبار لمدة ${leaveDurationSeconds} ثوانٍ`;
+      const reason = `مغادرة شاشة الامتحان لمدة ${awaySecs} ثانية`;
       const violationDetails: SecurityViolationDetails = {
         type: leaveType,
         timestamp: new Date().toISOString(),
         details: reason,
+        awaySeconds: awaySecs,
       };
 
       if (onViolationRef.current && activeRef.current && !isSubmittingRef.current) {
-        onViolationRef.current(nextCount, leaveDurationSeconds, reason, violationDetails);
+        onViolationRef.current(nextCount, awaySecs, reason, violationDetails);
       }
 
-      if (proctoringMode === "WARN") {
-        setWarnToastMessage(`⚠️ تنبيه: تم رصد مغادرة شاشة الاختبار لمدة ${leaveDurationSeconds} ثوانٍ. يرجى التركيز في صفحة الاختبار.`);
-      } else if (proctoringMode === "STRICT") {
-        if (nextCount > maxLeaves) {
-          hasAutoSubmittedRef.current = true;
-          setWarningModalOpen(false);
-          if (onAutoSubmitRef.current && activeRef.current && !isSubmittingRef.current) {
-            onAutoSubmitRef.current(nextCount, leaveDurationSeconds, reason, violationDetails);
-          }
-        } else {
-          setWarningModalOpen(true);
+      // 2-Strike Policy: Strike 1 shows warning modal, Strike 2 locks exam & submits
+      if (nextCount >= 2 || strictImmediateKick) {
+        hasAutoSubmittedRef.current = true;
+        setWarningModalOpen(false);
+        if (onAutoSubmitRef.current && activeRef.current && !isSubmittingRef.current) {
+          onAutoSubmitRef.current(nextCount, awaySecs, reason, violationDetails);
         }
+      } else {
+        setWarningModalOpen(true);
       }
     };
 
@@ -414,14 +426,19 @@ export function useExamSecurity({
       }
     };
 
+    // Eliminate false positives: Only treat blur as leave IF document is actually hidden
     const handleWindowBlur = () => {
       if (!activeRef.current || isSubmittingRef.current) return;
-      handleLeave("window_blur");
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        handleLeave("window_blur");
+      }
     };
 
     const handleWindowFocus = () => {
       if (!activeRef.current || isSubmittingRef.current) return;
-      handleReturn();
+      if (typeof document !== "undefined" && document.visibilityState === "visible") {
+        handleReturn();
+      }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -432,6 +449,10 @@ export function useExamSecurity({
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", handleWindowFocus);
+      if (graceTimerRef.current) {
+        clearTimeout(graceTimerRef.current);
+        graceTimerRef.current = null;
+      }
     };
   }, [active, isSubmitting, proctoringMode, graceSeconds, maxLeaves, strictImmediateKick]);
 
@@ -448,6 +469,10 @@ export function useExamSecurity({
     activeRef.current = false;
     isLeavingRef.current = false;
     leaveStartTimeRef.current = null;
+    if (graceTimerRef.current) {
+      clearTimeout(graceTimerRef.current);
+      graceTimerRef.current = null;
+    }
     setIsFocusLost(false);
     setWarningModalOpen(false);
     setWarnToastMessage(null);
@@ -472,6 +497,7 @@ export function useExamSecurity({
     requestFullscreen,
     exitFullscreen,
     unbindSecurity,
+    lastAwaySeconds,
   };
 }
 

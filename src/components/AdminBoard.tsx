@@ -2542,6 +2542,11 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                               <span className={`text-[9px] font-bold block ${sub.status === "VIOLATION_TERMINATED" || isStarted ? "text-rose-600 font-black" : "text-natural-muted font-mono"}`}>
                                 {sub.status === "VIOLATION_TERMINATED" ? "⛔ تم قفل الامتحان لمخالفة أمنية" : isStarted ? "⚠️ دخل الاختبار ولم يكمل" : `تم في: ${new Date(sub.submittedAt).toLocaleString("ar-EG")}`}
                               </span>
+                              {sub.networkInterrupted && (
+                                <span className="text-[9px] font-black text-sky-800 bg-sky-100 px-1.5 py-0.2 rounded border border-sky-300">
+                                  📶 تسليم بعد انقطاع النت ({sub.disconnectCount || 1} مرة - {sub.offlineDurationSeconds || 0}ث)
+                                </span>
+                              )}
                               {Boolean(sub.violationCount || sub.violations?.length) && (
                                 <span className="text-[9px] font-black text-rose-700 bg-rose-100 px-1.5 py-0.2 rounded border border-rose-300">
                                   ⚠️ {sub.violationCount || sub.violations?.length} مخالفات
@@ -3419,7 +3424,7 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                             <td className="py-2.5 px-4 text-center whitespace-nowrap">
                               <span className="inline-flex items-center gap-1 font-black px-2.5 py-1 rounded-xl bg-amber-500/10 text-amber-800 dark:text-amber-400 border border-amber-500/20 text-xs">
                                 <Award className="w-3.5 h-3.5 text-amber-600" />
-                                {cumScore.totalPoints} نقطة
+                                {Math.ceil(cumScore.totalPoints)} نقطة
                               </span>
                             </td>
                             <td className="py-2.5 px-4 text-left">
@@ -3594,10 +3599,29 @@ export default function AdminBoard({ state, onUpdateState, setError, setSuccess 
                         <div key={v.id || vIdx} className="bg-white dark:bg-slate-900 p-2 rounded-lg border border-rose-200 dark:border-rose-800 text-[10px] font-bold flex justify-between items-center text-rose-800 dark:text-rose-200">
                           <span>مخالفة ({vIdx + 1}): {v.reason || "التبديل بين التطبيقات / مغادرة الشاشة"}</span>
                           <span className="bg-rose-100 dark:bg-rose-950 px-2 py-0.5 rounded text-rose-900 dark:text-rose-200 font-mono">
-                            المدة: {v.leaveDuration}ث | {new Date(v.timestamp).toLocaleTimeString("ar-EG")}
+                            المدة: {v.awaySeconds || v.leaveDuration || 0}ث | {new Date(v.timestamp).toLocaleTimeString("ar-EG")}
                           </span>
                         </div>
                       ))}
+                    </div>
+                  )}
+                  {selectedSubmissionDetails.sub.status === "VIOLATION_TERMINATED" && (
+                    <div className="pt-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            const res = await ApiService.unlockQuizSubmission(selectedSubmissionDetails.sub.quizId, selectedSubmissionDetails.sub.userId);
+                            if (res.db) onUpdateState(res.db);
+                            setSelectedSubmissionDetails(null);
+                          } catch {
+                            console.warn("Failed to unlock submission");
+                          }
+                        }}
+                        className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black py-2.5 px-4 rounded-xl text-xs flex items-center justify-center gap-2 shadow-sm cursor-pointer transition-all"
+                      >
+                        🔓 إعادة فتح للطالب بالسماح بالمتابعة واستكمال الوقت
+                      </button>
                     </div>
                   )}
                 </div>

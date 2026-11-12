@@ -71,52 +71,15 @@ const playNotificationSound = () => {
   }
 };
 
-const CURRENT_VERSION = "1.0.4";
-
 export default function App() {
+  const APP_VERSION = "v1.1.0";
   const playedNotifIdsRef = React.useRef<Set<string>>(new Set());
-
-  // Startup Version Check & Cache Invalidation without logging out users
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const storedVersion = localStorage.getItem("app_version");
-      if (storedVersion !== CURRENT_VERSION) {
-        console.log(`[App Version Check] New version detected: ${CURRENT_VERSION} (was: ${storedVersion || "none"}). Invalidating old cached UI state...`);
-
-        // 1. Preserve critical session data
-        const marathonSession = localStorage.getItem("marathon_session");
-        const darkMode = localStorage.getItem("dark_mode");
-
-        // 2. Clear outdated UI caches and legacy credentials
-        const keysToKeep = new Set(["marathon_session", "dark_mode", "app_version", "offline_user_qr"]);
-        for (let i = localStorage.length - 1; i >= 0; i--) {
-          const key = localStorage.key(i);
-          if (key && !keysToKeep.has(key)) {
-            localStorage.removeItem(key);
-          }
-        }
-
-        // 3. Restore preserved session
-        if (marathonSession) localStorage.setItem("marathon_session", marathonSession);
-        if (darkMode) localStorage.setItem("dark_mode", darkMode);
-        localStorage.setItem("app_version", CURRENT_VERSION);
-
-        // 4. Invalidate old SW caches
-        if ('caches' in window) {
-          caches.keys().then((cacheNames) => {
-            cacheNames.forEach((name) => {
-              if (name !== 'APP_CACHE_V3') {
-                caches.delete(name);
-              }
-            });
-          });
-        }
-      }
-    }
-  }, []);
 
   const [state, setState] = useState<DatabaseState | null>(() => {
     if (typeof window !== "undefined") {
+      if (localStorage.getItem("byb_app_version") !== APP_VERSION) {
+        return null;
+      }
       const cached = localStorage.getItem("cached_state");
       if (cached) {
         try {
@@ -347,6 +310,9 @@ export default function App() {
   const [success, setSuccess] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(() => {
     if (typeof window !== "undefined") {
+      if (localStorage.getItem("byb_app_version") !== APP_VERSION) {
+        return true;
+      }
       return !localStorage.getItem("cached_state");
     }
     return true;
@@ -546,11 +512,11 @@ export default function App() {
   };
 
   // Fetch initial database state from server
-  const fetchState = async (forceRefresh = false) => {
+  const fetchState = async (forceRefresh = false, silent = false) => {
     if (!state) {
       setIsLoading(true);
     }
-    if (forceRefresh) {
+    if (forceRefresh && !silent) {
       setIsRefreshing(true);
     }
     try {
@@ -559,18 +525,27 @@ export default function App() {
       // Ensure the fetched data is valid and has users to prevent caching empty/corrupt states during Quota Exceeded errors
       if (data && Array.isArray(data.users) && data.users.length > 0) {
         setState(data);
-        if (forceRefresh) {
+        if (forceRefresh && !silent) {
           triggerSuccess("تم تحديث وجلب البيانات الحية من قاعدة البيانات السحابية (Firestore) بنجاح! 🔄");
           triggerDazzlingCelebration();
         }
       } else {
         console.warn("Received empty or invalid state from server. Preserving current client-side cached state.");
-        if (forceRefresh) {
+        if (forceRefresh && !silent) {
           throw new Error("فشل المزامنة: الاستجابة المستلمة من السيرفر فارغة أو غير مكتملة.");
         }
       }
     } catch (err: any) {
-      if (forceRefresh) {
+      if (forceRefresh && silent) {
+        try {
+          const fallbackData = await ApiService.getState(false);
+          if (fallbackData && Array.isArray(fallbackData.users) && fallbackData.users.length > 0) {
+            setState(fallbackData);
+            return;
+          }
+        } catch {}
+      }
+      if (forceRefresh && !silent) {
         triggerError(err.message || "فشل الاتصال بقاعدة البيانات السحابية (Firestore). يرجى التحقق من حالة الخدمة أو الحصة اليومية.");
       } else {
         setError(err.message || "حدث خطأ غير متوقع");
@@ -582,9 +557,51 @@ export default function App() {
   };
 
   useEffect(() => {
-    // Non-blocking background fetch: defer execution to next microtask/tick to guarantee initial UI paint completes first
+    let hasCacheMismatch = false;
+    if (typeof window !== "undefined") {
+      const storedVersion = localStorage.getItem("byb_app_version");
+      if (storedVersion !== APP_VERSION) {
+        hasCacheMismatch = true;
+        console.log(`[App Version Check] New version detected: ${APP_VERSION} (was: ${storedVersion || "none"}). Clearing stale cache...`);
+
+        // Preserve critical auth tokens, offline queue, dark mode, and active exam drafts
+        const shouldPreserveKey = (key: string): boolean =>
+          key.startsWith("firebase:authUser:") ||
+          key === "pending_offline_submissions" ||
+          key === "marathon_session" ||
+          key === "dark_mode" ||
+          key === "theme" ||
+          key === "offline_user_qr" ||
+          key === "byb_app_version" ||
+          key.startsWith("active_quiz_session_") ||
+          key.startsWith("quiz_answers_backup_");
+
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const key = localStorage.key(i);
+          if (key && !shouldPreserveKey(key)) {
+            localStorage.removeItem(key);
+          }
+        }
+
+        localStorage.setItem("byb_app_version", APP_VERSION);
+        setState(null);
+
+        // Invalidate old SW caches
+        if ("caches" in window) {
+          caches.keys().then((cacheNames) => {
+            cacheNames.forEach((name) => {
+              if (name !== "APP_CACHE_V3") {
+                caches.delete(name);
+              }
+            });
+          }).catch(() => {});
+        }
+      }
+    }
+
+    // Non-blocking background fetch: force fresh Firestore pull on version/cache mismatch
     const timer = setTimeout(() => {
-      fetchState();
+      fetchState(hasCacheMismatch, hasCacheMismatch);
     }, 0);
     return () => clearTimeout(timer);
   }, []);

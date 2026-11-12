@@ -139,7 +139,7 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
 
   // Calculate scores using the centralized helper - memoized to prevent redundant calculation
   const myScore = React.useMemo(() => {
-    const userAtt = state.attendance[currentUser.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
+    const userAtt = (state.attendance || {})[currentUser.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
     const rawScore = calculateParticipantScore(
       currentUser,
       userAtt,
@@ -151,9 +151,11 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
       state.quizTotals,
       state.quizCounts
     );
+    const safeTotal = Number(rawScore.totalPoints);
+    const finalTotalPoints = isNaN(safeTotal) ? 0 : Math.ceil(safeTotal);
     return {
       ...rawScore,
-      totalPoints: Math.ceil(rawScore.totalPoints),
+      totalPoints: finalTotalPoints,
     };
   }, [currentUser, state.attendance, state.tasks, state.quizSubmissions, state.confessions, state.bonuses, state.config, state.quizTotals, state.quizCounts]);
 
@@ -167,10 +169,10 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
 
   // Compute overall leaderboard rank - memoized to prevent calculating all scores on every user interaction
   const myRank = React.useMemo(() => {
-    const participantsScores = state.users
-      .filter((u) => u && u.role !== "admin" && u.username !== "." && u.id !== "." && u.name !== ".")
+    const participantsScores = (state.users || [])
+      .filter((u) => u && u.role !== "admin" && u.username !== "." && u.id !== ".")
       .map((user) => {
-        const userAtt = state.attendance[user.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
+        const userAtt = (state.attendance || {})[user.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
         const rawScore = calculateParticipantScore(
           user,
           userAtt,
@@ -182,12 +184,14 @@ export default function ParticipantBoard({ currentUser, state, onUpdateState, on
           state.quizTotals,
           state.quizCounts
         );
+        const safeTotal = Number(rawScore.totalPoints);
+        const finalTotalPoints = isNaN(safeTotal) ? 0 : Math.ceil(safeTotal);
         return {
           id: user.id,
-          score: Math.ceil(rawScore.totalPoints),
+          totalPoints: finalTotalPoints,
         };
       })
-      .sort((a, b) => b.score - a.score);
+      .sort((a, b) => (b.totalPoints || 0) - (a.totalPoints || 0));
 
     return participantsScores.findIndex((p) => p.id === currentUser.id) + 1;
   }, [state.users, state.attendance, state.tasks, state.quizSubmissions, state.confessions, state.bonuses, state.config, state.quizTotals, state.quizCounts, currentUser.id]);

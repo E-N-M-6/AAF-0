@@ -166,8 +166,8 @@ export interface QuizSubmission {
   id: string;
   quizId: string;
   userId: string;
-  answers: Record<string, string>; // questionId -> answer
-  questionResults: Record<string, QuizQuestionResult>; // questionId -> result
+  answers?: Record<string, string>; // questionId -> answer (omitted for peer public view)
+  questionResults?: Record<string, QuizQuestionResult>; // questionId -> result (omitted for peer public view)
   essayGrades?: Record<string, EssayGradeItem>; // questionId -> essay grade
   totalScore: number;
   submittedAt: string;

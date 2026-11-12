@@ -44,18 +44,22 @@ export default function Leaderboard({
 
   // Memoize participant score calculations and ranking so typing doesn't re-execute them
   const rankedScores = React.useMemo(() => {
-    const participants = users.filter((u) => u && u.role !== "admin" && u.username !== "." && u.id !== "." && u.name !== ".");
+    const participants = (users || []).filter(
+      (u) => u && u.role !== "admin" && u.username !== "." && u.id !== "."
+    );
 
     const scores: ParticipantScore[] = participants.map((user) => {
-      const userAtt = attendance[user.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
+      const userAtt = (attendance || {})[user.id] || { meetings: [], liturgy: [], praise: [], liturgyScores: {} };
       const rawScore = calculateParticipantScore(user, userAtt, tasks, quizSubmissions, confessions, bonuses, config, quizTotals, quizCounts);
+      const safeTotal = Number(rawScore.totalPoints);
+      const finalTotalPoints = isNaN(safeTotal) ? 0 : Math.ceil(safeTotal);
       return {
         ...rawScore,
-        totalPoints: Math.ceil(rawScore.totalPoints),
+        totalPoints: finalTotalPoints,
       };
     });
 
-    const sortedScores = [...scores].sort((a, b) => b.totalPoints - a.totalPoints);
+    const sortedScores = [...scores].sort((a, b) => (b.totalPoints || 0) - (a.totalPoints || 0));
 
     let denseRank = 1;
     let prevPoints = -1;
@@ -72,7 +76,7 @@ export default function Leaderboard({
   }, [users, attendance, tasks, quizSubmissions, quizTotals, quizCounts, confessions, bonuses, config]);
 
   const filteredScores = rankedScores.filter((s) =>
-    s.name.toLowerCase().includes(searchTerm.toLowerCase())
+    (s.name || "").toLowerCase().includes(searchTerm.toLowerCase())
   );
 
   const getRankBadge = (rank: number) => {

@@ -791,6 +791,11 @@ interface QuizSubmission {
   awaySeconds?: number;
 }
 
+type PublicQuizSubmission = Pick<
+  QuizSubmission,
+  "id" | "userId" | "quizId" | "totalScore" | "status" | "submittedAt" | "networkInterrupted"
+>;
+
 interface DatabaseSchema {
   users: User[];
   attendance: Record<string, Attendance>; // key: userId
@@ -1479,7 +1484,14 @@ async function authenticateUser(req: express.Request, preLoadedDb?: DatabaseSche
 }
 
 // 2.5. Central Sanitizer for Database State based on User Role & Identity
-function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema & { quizTotals: Record<string, number>; quizCounts: Record<string, number> } {
+function sanitizeDBState(
+  db: DatabaseSchema,
+  user: User | null
+): Omit<DatabaseSchema, "quizSubmissions"> & {
+  quizSubmissions: (QuizSubmission | PublicQuizSubmission)[];
+  quizTotals: Record<string, number>;
+  quizCounts: Record<string, number>;
+} {
   if (!db) {
     return {
       users: [],
@@ -1543,8 +1555,11 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
         if (userConf.months) {
           const sanitizedMonths: Record<string, ConfessionMonth> = {};
           Object.keys(userConf.months).forEach(monthKey => {
+            const m = userConf.months[monthKey];
             sanitizedMonths[monthKey] = {
-              status: userConf.months[monthKey].status,
+              status: m.status,
+              ...(m.approvedAt ? { approvedAt: m.approvedAt } : {}),
+              ...(m.submittedAt ? { submittedAt: m.submittedAt } : {}),
             };
           });
           sanitizedConfessions[userId] = { months: sanitizedMonths };
@@ -1556,7 +1571,7 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
   // 3. Sanitize tasks:
   // - Admin sees all tasks but with proofImage stripped to "EXISTS" to prevent giant bandwidth consumption
   // - Participant themselves see their own tasks but with proofImage stripped to "EXISTS"
-  // - Other users see other tasks with proofImage and proofNote stripped to "EXISTS"
+  // - Other users see other tasks with proofImage/proofNote/proofImagePath stripped while preserving points & status
   const sanitizedTasks = (db.tasks || []).map(t => {
     const isSelf = user && t.userId === user.id;
     const hasProof = Boolean(t.proofImagePath || (t.proofImage && t.proofImage.trim()));
@@ -1566,8 +1581,9 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
         proofImage: hasProof ? "EXISTS" : "",
       };
     } else {
+      const { proofImagePath: _dropPath, ...safeTask } = t;
       return {
-        ...t,
+        ...safeTask,
         proofImage: hasProof ? "EXISTS" : "",
         proofNote: hasProof ? "EXISTS" : "",
       };
@@ -1589,7 +1605,7 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
   const quizCounts: Record<string, number> = {};
 
   for (const s of (db.quizSubmissions || [])) {
-    if (s.status !== "completed") continue;
+    if (s.status !== "completed" && s.status !== "graded") continue;
     if (resetAt > 0) {
       const time = s.submittedAt ? new Date(s.submittedAt).getTime() : 0;
       if (time <= resetAt) continue;
@@ -1604,9 +1620,9 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
   // - Non-admins (participants and guests):
   //   a. Strip `correctAnswer` from every question in every quiz object.
   //   b. Omit other users' `userExtensions` (keep only caller's own extension if any).
-  //   c. Return ONLY caller's own quizSubmissions.
+  //   c. Return full submission for caller's own attempts, and a sanitized public view (scores & metadata only, no answers/results/violations) for peers.
   let sanitizedQuizzes: Quiz[];
-  let sanitizedSubmissions: QuizSubmission[];
+  let sanitizedSubmissions: (QuizSubmission | PublicQuizSubmission)[];
 
   if (isAdmin) {
     sanitizedQuizzes = db.quizzes || [];
@@ -1630,9 +1646,19 @@ function sanitizeDBState(db: DatabaseSchema, user: User | null): DatabaseSchema 
       };
     });
 
-    sanitizedSubmissions = (db.quizSubmissions || []).filter(s => {
-      if (!user || !user.id) return false;
-      return s.userId === user.id;
+    sanitizedSubmissions = (db.quizSubmissions || []).map((s): QuizSubmission | PublicQuizSubmission => {
+      if (user && user.id && s.userId === user.id) {
+        return s;
+      }
+      return {
+        id: s.id,
+        userId: s.userId,
+        quizId: s.quizId,
+        totalScore: s.totalScore,
+        status: s.status,
+        submittedAt: s.submittedAt,
+        ...(s.networkInterrupted !== undefined ? { networkInterrupted: s.networkInterrupted } : {}),
+      };
     });
   }
 
